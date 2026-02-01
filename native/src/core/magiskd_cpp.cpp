@@ -7,12 +7,14 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <arpa/inet.h>
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
 #include <grp.h>
+#include <poll.h>
 #include <string>
 #include <vector>
 
@@ -486,19 +488,155 @@ static int32_t db_get_setting_i32(const char *key, int32_t def) {
     return out;
 }
 
-static SuPolicy db_get_su_policy_for_uid(int32_t uid) {
-    int32_t pol = static_cast<int32_t>(SuPolicy::Query);
-    bool got = false;
-    auto cb = [&](StringSlice, const DbValues &v) {
-        pol = v.get_int(0);
-        got = true;
+struct RootSettingsCpp {
+    SuPolicy policy = SuPolicy::Query;
+    bool log = false;
+    bool notify = false;
+};
+
+static RootSettingsCpp db_get_root_settings_for_uid(int32_t uid) {
+    RootSettingsCpp out{};
+    auto cb = [&](StringSlice columns, const DbValues &v) {
+        for (int i = 0; i < columns.size(); ++i) {
+            const auto &col = columns[i];
+            const int val = v.get_int(i);
+            if (col == "policy") out.policy = static_cast<SuPolicy>(val);
+            else if (col == "logging") out.log = (val != 0);
+            else if (col == "notification") out.notify = (val != 0);
+        }
     };
-    db_exec(
-        "SELECT policy FROM policies WHERE uid=? AND (until=0 OR until>strftime('%s', 'now'))",
+    (void)db_exec(
+        "SELECT policy, logging, notification FROM policies "
+        "WHERE uid=? AND (until=0 OR until>strftime('%s', 'now'))",
         DbArgs{static_cast<int64_t>(uid)},
         cb
     );
-    (void)got;
+    return out;
+}
+
+static std::string db_get_string_value(const char *key) {
+    std::string out;
+    auto cb = [&](StringSlice, const DbValues &v) {
+        const char *s = v.get_text(0);
+        if (s) out.assign(s);
+    };
+    (void)db_exec("SELECT value FROM strings WHERE key=?", DbArgs{key}, cb);
+    return out;
+}
+
+static int32_t get_package_uid_guess(int32_t user, const std::string &pkg) {
+    struct stat st{};
+    // Try both /data/user_de and /data/user
+    {
+        std::string p = std::string("/data/user_de/") + std::to_string(user) + "/" + pkg;
+        if (stat(p.c_str(), &st) == 0) return static_cast<int32_t>(st.st_uid);
+    }
+    {
+        std::string p = std::string("/data/user/") + std::to_string(user) + "/" + pkg;
+        if (stat(p.c_str(), &st) == 0) return static_cast<int32_t>(st.st_uid);
+    }
+    return -1;
+}
+
+static std::pair<int32_t, std::string> get_manager_for_user(int32_t user, bool /*install*/) {
+    // Bring-up: only use DB string + package uid heuristic (no signature checks / stub install).
+    std::string pkg = db_get_string_value("requester");
+    if (pkg.empty()) {
+        pkg = JAVA_PACKAGE_NAME;
+    }
+    int32_t uid = get_package_uid_guess(user, pkg);
+    if (uid < 0) return {-1, ""};
+    return {uid, pkg};
+}
+
+static SuPolicy query_su_manager(
+    int32_t mgr_uid,
+    const std::string &mgr_pkg,
+    int32_t user,
+    int32_t eval_uid,
+    int32_t pid
+) {
+    // Best-effort implementation matching Rust FIFO handshake shape.
+    // If anything fails, deny for safety.
+    if (mgr_uid < 0 || mgr_pkg.empty()) return SuPolicy::Deny;
+
+    // Ensure tmp/.magisk exists
+    std::string intl = std::string(detect_magisk_tmp()) + "/" INTLROOT;
+    mkdirs(intl.c_str(), 0755);
+
+    std::string fifo = intl + "/su_request_" + std::to_string(pid);
+    unlink(fifo.c_str());
+    if (mkfifo(fifo.c_str(), 0600) != 0) {
+        return SuPolicy::Deny;
+    }
+    // Chown to manager so it can open it
+    (void)chown(fifo.c_str(), mgr_uid, mgr_uid);
+
+    // Trigger manager UI: equivalent to SuAppContext::app_request() -> am start
+    std::string user_s = std::to_string(user);
+    std::string uid_s = std::to_string(eval_uid);
+    std::string pid_s = std::to_string(pid);
+
+    // We don't parse output; just fire once (bring-up).
+    (void)exec_command_sync(
+        "/system/bin/app_process",
+        "/system/bin",
+        "com.android.commands.am.Am",
+        "start",
+        "-p",
+        mgr_pkg.c_str(),
+        "--user",
+        user_s.c_str(),
+        "-a",
+        "android.intent.action.VIEW",
+        "-f",
+        "0x18800020",
+        "--es",
+        "action",
+        "request",
+        "--es",
+        "fifo",
+        fifo.c_str(),
+        "--ei",
+        "uid",
+        uid_s.c_str(),
+        "--ei",
+        "pid",
+        pid_s.c_str()
+    );
+
+    // Open with O_RDWR to prevent FIFO open block
+    int fd = xopen(fifo.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        unlink(fifo.c_str());
+        return SuPolicy::Deny;
+    }
+
+    pollfd pfd{};
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    int prc = poll(&pfd, 1, 70 * 1000);
+    if (prc <= 0) {
+        close(fd);
+        unlink(fifo.c_str());
+        return SuPolicy::Deny;
+    }
+
+    int32_t be = 0;
+    if (xxread(fd, &be, sizeof(be)) != sizeof(be)) {
+        close(fd);
+        unlink(fifo.c_str());
+        return SuPolicy::Deny;
+    }
+
+    close(fd);
+    unlink(fifo.c_str());
+
+    uint32_t u = static_cast<uint32_t>(be);
+    int32_t pol = static_cast<int32_t>(ntohl(u));
+    if (pol < static_cast<int32_t>(SuPolicy::Query) || pol > static_cast<int32_t>(SuPolicy::Restrict)) {
+        return SuPolicy::Deny;
+    }
     return static_cast<SuPolicy>(pol);
 }
 
@@ -520,9 +658,9 @@ static bool su_allowed_by_settings(int32_t uid, int32_t eval_uid) {
     }
 }
 
-static bool eval_su_access(int32_t uid, SuPolicy &policy_out, MntNsMode &mntns_out) {
+static bool eval_su_access(int32_t uid, RootSettingsCpp &settings_out, MntNsMode &mntns_out, int32_t pid) {
     if (uid == AID_ROOT) {
-        policy_out = SuPolicy::Allow;
+        settings_out.policy = SuPolicy::Allow;
         mntns_out = MntNsMode::Requester;
         return true;
     }
@@ -549,10 +687,28 @@ static bool eval_su_access(int32_t uid, SuPolicy &policy_out, MntNsMode &mntns_o
 
     if (!su_allowed_by_settings(uid, eval_uid)) return false;
 
-    auto policy = db_get_su_policy_for_uid(eval_uid);
-    policy_out = policy;
+    auto settings = db_get_root_settings_for_uid(eval_uid);
+
+    // If it's the manager itself, allow silently (match Rust behavior).
+    auto [mgr_uid, mgr_pkg] = get_manager_for_user(to_user_id(eval_uid), true);
+    if (mgr_uid >= 0 && to_app_id(uid) == to_app_id(mgr_uid)) {
+        settings.policy = SuPolicy::Allow;
+        settings.log = false;
+        settings.notify = false;
+    }
+
+    // If policy is Query, ask manager (best-effort bring-up).
+    if (settings.policy == SuPolicy::Query) {
+        if (mgr_uid < 0) {
+            settings.policy = SuPolicy::Deny;
+        } else {
+            settings.policy = query_su_manager(mgr_uid, mgr_pkg, to_user_id(eval_uid), eval_uid, pid);
+        }
+    }
+
+    settings_out = settings;
     mntns_out = mntns;
-    return policy == SuPolicy::Allow || policy == SuPolicy::Restrict;
+    return settings.policy == SuPolicy::Allow || settings.policy == SuPolicy::Restrict;
 }
 
 static bool uid_granted_root(int32_t uid) {
@@ -805,15 +961,16 @@ static void handle_client(int cfd) {
                 break;
             }
 
-            SuPolicy policy = SuPolicy::Deny;
+            RootSettingsCpp settings{};
             MntNsMode mntns = MntNsMode::Requester;
-            bool allowed = has_cred && eval_su_access(static_cast<int32_t>(cred.uid), policy, mntns);
+            bool allowed =
+                has_cred && eval_su_access(static_cast<int32_t>(cred.uid), settings, mntns, has_cred ? cred.pid : -1);
             if (!allowed) {
                 write_pod_i32(cfd, static_cast<int32_t>(SuPolicy::Deny));
                 break;
             }
 
-            if (policy == SuPolicy::Restrict) {
+            if (settings.policy == SuPolicy::Restrict) {
                 req.drop_cap = true;
             }
 
