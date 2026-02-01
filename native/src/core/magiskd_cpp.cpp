@@ -146,6 +146,48 @@ static bool read_string(int fd, std::string &out) {
     return xxread(fd, out.data(), static_cast<size_t>(len)) == len;
 }
 
+static std::string read_string(int fd) {
+    std::string out;
+    (void)read_string(fd, out);
+    return out;
+}
+
+static std::string get_peer_context(int fd) {
+#ifdef SO_PEERSEC
+    char buf[256] = {};
+    socklen_t len = sizeof(buf);
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERSEC, buf, &len) == 0) {
+        // `len` may include trailing NUL, clamp safely.
+        size_t n = strnlen(buf, sizeof(buf));
+        return std::string(buf, n);
+    }
+#endif
+    (void)fd;
+    return {};
+}
+
+static void handle_sqlite_cmd(int fd) {
+    auto sql = read_string(fd);
+    if (sql.empty()) {
+        (void)write_string(fd, "");
+        return;
+    }
+
+    auto cb = [&](StringSlice columns, const DbValues &values) {
+        std::string out;
+        for (int i = 0; i < columns.size(); ++i) {
+            if (i != 0) out.push_back('|');
+            out += columns[i].c_str();
+            out.push_back('=');
+            out += values.get_text(i);
+        }
+        (void)write_string(fd, out);
+    };
+
+    (void)db_exec(sql.c_str(), {}, cb);
+    (void)write_string(fd, "");
+}
+
 static int recv_fd_once(int sock) {
     int32_t fd_count = 0;
 
@@ -402,23 +444,56 @@ static void run_root_shell(int client, int pid, const SuRequestCpp &req, MntNsMo
 }
 
 static void handle_client(int cfd) {
-    // Minimal auth based on SO_PEERCRED (skeleton bring-up).
-    // Full parity will add SO_PEERSEC checks and stricter gating.
     ucred cred{};
     socklen_t cred_len = sizeof(cred);
     bool has_cred =
         getsockopt(cfd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) == 0 && cred_len == sizeof(cred);
 
+    const auto context = get_peer_context(cfd);
+    const bool is_root = has_cred && cred.uid == 0;
+    const bool is_shell = has_cred && cred.uid == AID_SHELL;
+    const bool is_zygote = (context == "u:r:zygote:s0");
+
+    // TODO: parity with Rust `check-client` feature.
+    const bool is_client = true;
+
+    if (!is_root && !is_zygote && !is_client) {
+        write_pod_i32(cfd, static_cast<int32_t>(RespondCode::ACCESS_DENIED));
+        return;
+    }
+
     int32_t code = -1;
     if (!read_pod_i32(cfd, code)) return;
     if (!is_valid_request(code)) return;
 
-    // Permission checks (subset).
-    if (static_cast<RequestCode>(code) == RequestCode::STOP_DAEMON) {
-        if (!has_cred || cred.uid != 0) {
-            write_pod_i32(cfd, static_cast<int32_t>(RespondCode::ROOT_REQUIRED));
-            return;
-        }
+    // Permission checks (match daemon.rs).
+    switch (static_cast<RequestCode>(code)) {
+        case RequestCode::POST_FS_DATA:
+        case RequestCode::LATE_START:
+        case RequestCode::BOOT_COMPLETE:
+        case RequestCode::ZYGOTE_RESTART:
+        case RequestCode::SQLITE_CMD:
+        case RequestCode::DENYLIST:
+        case RequestCode::STOP_DAEMON:
+            if (!is_root) {
+                write_pod_i32(cfd, static_cast<int32_t>(RespondCode::ROOT_REQUIRED));
+                return;
+            }
+            break;
+        case RequestCode::REMOVE_MODULES:
+            if (!is_root && !is_shell) {
+                write_pod_i32(cfd, static_cast<int32_t>(RespondCode::ACCESS_DENIED));
+                return;
+            }
+            break;
+        case RequestCode::ZYGISK:
+            if (!is_zygote) {
+                write_pod_i32(cfd, static_cast<int32_t>(RespondCode::ACCESS_DENIED));
+                return;
+            }
+            break;
+        default:
+            break;
     }
 
     if (!write_pod_i32(cfd, static_cast<int32_t>(RespondCode::OK))) return;
@@ -447,6 +522,10 @@ static void handle_client(int cfd) {
             // Match daemon.rs: write 0 then exit.
             write_pod_i32(cfd, 0);
             _exit(0);
+        }
+        case RequestCode::SQLITE_CMD: {
+            handle_sqlite_cmd(cfd);
+            break;
         }
         case RequestCode::SUPERUSER: {
             SuRequestCpp req{};

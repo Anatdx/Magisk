@@ -1,5 +1,7 @@
 #include <dlfcn.h>
 
+#include <mutex>
+
 #include <consts.hpp>
 #include <base.hpp>
 #include <sqlite.hpp>
@@ -304,11 +306,23 @@ sqlite3 *open_and_init_db() {
     return db.release();
 }
 
-// Exported from Rust
-extern "C" int sql_exec_rs(
+// Exported from Rust in the normal build. For pure-C++ bring-up (e.g. magiskd-cpp),
+// provide a weak fallback that opens the DB and executes directly.
+extern "C" __attribute__((weak)) int sql_exec_rs(
         rust::Str zSql,
         sql_bind_callback bind_cb, void *bind_cookie,
-        sql_exec_callback exec_cb, void *exec_cookie);
+        sql_exec_callback exec_cb, void *exec_cookie) {
+    static std::mutex m;
+    static sqlite3 *db = nullptr;
+    std::lock_guard<std::mutex> lock(m);
+    if (db == nullptr) {
+        db = open_and_init_db();
+    }
+    if (db == nullptr) {
+        return -1;
+    }
+    return sql_exec_impl(db, zSql, bind_cb, bind_cookie, exec_cb, exec_cookie);
+}
 
 bool db_exec(const char *sql, DbArgs args, db_exec_callback exec_fn) {
     using db_bind_callback = std::function<int(int, DbStatement&)>;
