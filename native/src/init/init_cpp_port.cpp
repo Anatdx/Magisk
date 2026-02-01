@@ -12,7 +12,7 @@ extern "C" {
 extern char **environ;
 }
 
-void MagiskInit::prepare_data_cpp() const {
+void MagiskInit::prepare_data_cpp() const noexcept {
     LOGD("init-cpp: prepare_data_cpp\n");
 
     // Equivalent of Rust `prepare_data()`:
@@ -27,7 +27,7 @@ void MagiskInit::prepare_data_cpp() const {
     (void)cp_afc("/overlay.d", "/data/overlay.d");
 }
 
-[[noreturn]] void MagiskInit::exec_init_cpp() {
+[[noreturn]] void MagiskInit::exec_init_cpp() noexcept {
     LOGD("init-cpp: exec_init_cpp\n");
 
     // Unmount in reverse order
