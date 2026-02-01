@@ -605,7 +605,8 @@ static SuPolicy query_su_manager(
     std::string pid_s = std::to_string(pid);
 
     // We don't parse output; just fire once (bring-up).
-    (void)exec_command_sync(
+    // Must set CLASSPATH for app_process main class.
+    std::vector<const char *> argv = {
         "/system/bin/app_process",
         "/system/bin",
         "com.android.commands.am.Am",
@@ -617,6 +618,8 @@ static SuPolicy query_su_manager(
         "-a",
         "android.intent.action.VIEW",
         "-f",
+        // FLAG_ACTIVITY_NEW_TASK|FLAG_ACTIVITY_MULTIPLE_TASK|
+        // FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS|FLAG_INCLUDE_STOPPED_PACKAGES
         "0x18800020",
         "--es",
         "action",
@@ -629,8 +632,13 @@ static SuPolicy query_su_manager(
         uid_s.c_str(),
         "--ei",
         "pid",
-        pid_s.c_str()
-    );
+        pid_s.c_str(),
+        nullptr,
+    };
+    exec_t exec{};
+    exec.argv = argv.data();
+    exec.pre_exec = []() { setenv("CLASSPATH", "/system/framework/am.jar", 1); };
+    (void)exec_command_sync(exec);
 
     // Open with O_RDWR to prevent FIFO open block
     int fd = xopen(fifo.c_str(), O_RDWR | O_CLOEXEC);
@@ -667,6 +675,107 @@ static SuPolicy query_su_manager(
     return static_cast<SuPolicy>(pol);
 }
 
+static std::string escape_extra_string(std::string_view s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s) {
+        if (c == '\\' || c == ':') out.push_back('\\');
+        out.push_back(c);
+    }
+    return out;
+}
+
+static void su_log_notify_async(
+    const RootSettingsCpp &settings,
+    const std::string &mgr_pkg,
+    int32_t user,
+    int32_t from_uid,
+    int32_t pid,
+    const SuRequestCpp &req
+) {
+    if (!settings.log && !settings.notify) return;
+    if (mgr_pkg.empty()) return;
+    if (fork_dont_care() != 0) return;
+
+    // In child
+    std::string provider = "content://" + mgr_pkg + ".provider";
+    std::string user_s = std::to_string(user);
+    std::string from_uid_s = std::to_string(from_uid);
+    std::string to_uid_s = std::to_string(req.target_uid);
+    std::string pid_s = std::to_string(pid);
+    std::string policy_s = std::to_string(static_cast<int32_t>(settings.policy));
+    std::string target_s = std::to_string(req.target_pid);
+    std::string notify_s = settings.notify ? "true" : "false";
+
+    std::string gids_csv;
+    if (!req.gids.empty()) {
+        for (auto g : req.gids) {
+            gids_csv += std::to_string(g);
+            gids_csv.push_back(',');
+        }
+        gids_csv.pop_back();
+    }
+
+    const std::string command = req.command.empty() ? req.shell : req.command;
+
+    auto mk_extra_i = [](const char *key, const std::string &v) {
+        return std::string(key) + ":i:" + v;
+    };
+    auto mk_extra_b = [](const char *key, const std::string &v) {
+        return std::string(key) + ":b:" + v;
+    };
+    auto mk_extra_s = [](const char *key, std::string_view v) {
+        return std::string(key) + ":s:" + escape_extra_string(v);
+    };
+
+    std::vector<std::string> extras;
+    const char *method = nullptr;
+
+    if (settings.log) {
+        method = "log";
+        extras.emplace_back(mk_extra_i("from.uid", from_uid_s));
+        extras.emplace_back(mk_extra_i("to.uid", to_uid_s));
+        extras.emplace_back(mk_extra_i("pid", pid_s));
+        extras.emplace_back(mk_extra_i("policy", policy_s));
+        extras.emplace_back(mk_extra_i("target", target_s));
+        extras.emplace_back(mk_extra_s("context", req.context));
+        extras.emplace_back(mk_extra_s("gids", gids_csv));
+        extras.emplace_back(mk_extra_s("command", command));
+        extras.emplace_back(mk_extra_b("notify", notify_s));
+    } else {
+        method = "notify";
+        extras.emplace_back(mk_extra_i("from.uid", from_uid_s));
+        extras.emplace_back(mk_extra_i("pid", pid_s));
+        extras.emplace_back(mk_extra_i("policy", policy_s));
+    }
+
+    // Build argv for: app_process ... Content call --uri ... --user ... --method ... --extra <k:t:v>...
+    std::vector<const char *> argv;
+    argv.reserve(16 + extras.size() * 2);
+    argv.push_back("/system/bin/app_process");
+    argv.push_back("/system/bin");
+    argv.push_back("com.android.commands.content.Content");
+    argv.push_back("call");
+    argv.push_back("--uri");
+    argv.push_back(provider.c_str());
+    argv.push_back("--user");
+    argv.push_back(user_s.c_str());
+    argv.push_back("--method");
+    argv.push_back(method);
+
+    for (auto &e : extras) {
+        argv.push_back("--extra");
+        argv.push_back(e.c_str());
+    }
+    argv.push_back(nullptr);
+
+    exec_t exec{};
+    exec.argv = argv.data();
+    exec.pre_exec = []() { setenv("CLASSPATH", "/system/framework/content.jar", 1); };
+    (void)exec_command_sync(exec);
+    exit(0);
+}
+
 static bool su_allowed_by_settings(int32_t uid, int32_t eval_uid) {
     auto root_access = static_cast<RootAccess>(db_get_setting_i32("root_access",
         static_cast<int32_t>(RootAccess::AppsAndAdb)));
@@ -685,7 +794,13 @@ static bool su_allowed_by_settings(int32_t uid, int32_t eval_uid) {
     }
 }
 
-static bool eval_su_access(int32_t uid, RootSettingsCpp &settings_out, MntNsMode &mntns_out, int32_t pid) {
+static bool eval_su_access(
+    int32_t uid,
+    const SuRequestCpp &req,
+    RootSettingsCpp &settings_out,
+    MntNsMode &mntns_out,
+    int32_t pid
+) {
     if (uid == AID_ROOT) {
         settings_out.policy = SuPolicy::Allow;
         mntns_out = MntNsMode::Requester;
@@ -732,6 +847,10 @@ static bool eval_su_access(int32_t uid, RootSettingsCpp &settings_out, MntNsMode
             settings.policy = query_su_manager(mgr_uid, mgr_pkg, to_user_id(eval_uid), eval_uid, pid);
         }
     }
+
+    // Notify/log to manager asynchronously (best-effort).
+    // In Rust, this happens after Query resolution but before returning to caller.
+    su_log_notify_async(settings, mgr_pkg, to_user_id(eval_uid), uid, pid, req);
 
     settings_out = settings;
     mntns_out = mntns;
@@ -989,8 +1108,13 @@ static void handle_client(int cfd) {
 
             RootSettingsCpp settings{};
             MntNsMode mntns = MntNsMode::Requester;
-            bool allowed =
-                has_cred && eval_su_access(static_cast<int32_t>(cred.uid), settings, mntns, has_cred ? cred.pid : -1);
+            bool allowed = has_cred && eval_su_access(
+                static_cast<int32_t>(cred.uid),
+                req,
+                settings,
+                mntns,
+                has_cred ? cred.pid : -1
+            );
             if (!allowed) {
                 write_pod_i32(cfd, static_cast<int32_t>(SuPolicy::Deny));
                 break;
