@@ -133,11 +133,32 @@ static inline int32_t to_user_id(int32_t uid) { return uid / AID_USER_OFFSET; }
 
 static std::atomic<bool> denylist_enforced{false};
 
+struct ExeAttr {
+    dev_t dev{};
+    ino_t ino{};
+    bool valid = false;
+};
+
+static ExeAttr g_self_exe{};
+
 static bool is_valid_request(int32_t code) {
     if (code < 0 || code >= static_cast<int32_t>(RequestCode::END)) return false;
     if (code == static_cast<int32_t>(RequestCode::_SYNC_BARRIER_)) return false;
     if (code == static_cast<int32_t>(RequestCode::_STAGE_BARRIER_)) return false;
     return true;
+}
+
+static bool is_client_process(pid_t pid) {
+    // Best-effort parity with Rust `check-client` feature:
+    // compare /proc/<pid>/exe dev+ino to current process exe dev+ino.
+    if (!g_self_exe.valid) return true; // allow in bring-up if unknown
+    if (pid <= 0) return false;
+
+    char path[64];
+    ssprintf(path, sizeof(path), "/proc/%d/exe", pid);
+    struct stat st{};
+    if (stat(path, &st) != 0) return false;
+    return st.st_dev == g_self_exe.dev && st.st_ino == g_self_exe.ino;
 }
 
 static const char *detect_magisk_tmp() {
@@ -221,6 +242,12 @@ static bool set_db_setting_i32(const char *key, int32_t value) {
         "INSERT OR REPLACE INTO settings (key,value) VALUES(?,?)",
         DbArgs{key, static_cast<int64_t>(value)}
     );
+}
+
+static void init_denylist_state_from_db() {
+    // settings key matches DbEntryKey::DenylistConfig -> "denylist"
+    const int32_t v = db_get_setting_i32("denylist", 0);
+    denylist_enforced.store(v != 0, std::memory_order_relaxed);
 }
 
 static bool denylist_row_exists(const std::string &pkg, const std::string &proc) {
@@ -865,8 +892,7 @@ static void handle_client(int cfd) {
     const bool is_shell = has_cred && cred.uid == AID_SHELL;
     const bool is_zygote = (context == "u:r:zygote:s0");
 
-    // TODO: parity with Rust `check-client` feature.
-    const bool is_client = true;
+    const bool is_client = has_cred && is_client_process(cred.pid);
 
     if (!is_root && !is_zygote && !is_client) {
         write_pod_i32(cfd, static_cast<int32_t>(RespondCode::ACCESS_DENIED));
@@ -1000,6 +1026,19 @@ static void handle_client(int cfd) {
 int main(int argc, char *argv[]) {
     (void)argc;
     (void)argv;
+
+    // Capture self /proc/self/exe dev+ino for client validation
+    {
+        struct stat st{};
+        if (stat("/proc/self/exe", &st) == 0) {
+            g_self_exe.dev = st.st_dev;
+            g_self_exe.ino = st.st_ino;
+            g_self_exe.valid = true;
+        }
+    }
+
+    // Initialize denylist cached state from DB so status/zygisk flags reflect reality.
+    init_denylist_state_from_db();
 
     // Ensure directory exists: <tmp> + DEVICEDIR (".magisk/device")
     mkdirs(sock_dir().c_str(), 0755);
