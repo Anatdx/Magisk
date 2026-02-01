@@ -29,10 +29,31 @@ LOCAL_SRC_FILES := \
     core/deny/utils.cpp \
     core/deny/logcat.cpp
 
+LOCAL_C_INCLUDES := \
+    $(LOCAL_PATH)/core/include
+
 LOCAL_LDLIBS := -llog
 LOCAL_LDFLAGS := -Wl,--dynamic-list=src/exported_sym.txt
 
 include $(BUILD_EXECUTABLE)
+
+ifdef MAGISK_CPP_DAEMON
+include $(CLEAR_VARS)
+LOCAL_MODULE := magiskd-cpp
+LOCAL_STATIC_LIBRARIES := \
+    libbase
+
+LOCAL_SRC_FILES := \
+    core/magiskd_cpp.cpp \
+    core/sqlite.cpp
+
+LOCAL_C_INCLUDES := \
+    $(LOCAL_PATH)/core/include
+
+LOCAL_LDLIBS := -llog
+
+include $(BUILD_EXECUTABLE)
+endif
 
 endif
 
@@ -60,6 +81,7 @@ LOCAL_SRC_FILES := \
     init/mount.cpp \
     init/rootdir.cpp \
     init/getinfo.cpp \
+    init/init_cpp_port.cpp \
     init/init-rs.cpp
 
 LOCAL_LDFLAGS := -static

@@ -1,4 +1,5 @@
 use crate::ffi::{BootConfig, MagiskInit, backup_init, magisk_proxy_main};
+use crate::consts::MAGISK_CPP_INIT;
 use crate::logging::setup_klog;
 use crate::mount::is_rootfs;
 use crate::twostage::hexpatch_init_for_second_stage;
@@ -31,7 +32,11 @@ impl MagiskInit {
 
     fn first_stage(&self) {
         info!("First Stage Init");
-        self.prepare_data();
+        if MAGISK_CPP_INIT {
+            self.prepare_data_cpp();
+        } else {
+            self.prepare_data();
+        }
 
         if !cstr!("/sdcard").exists() && !cstr!("/first_stage_ramdisk/sdcard").exists() {
             self.hijack_init_with_switch_root();
@@ -71,7 +76,11 @@ impl MagiskInit {
 
     fn legacy_system_as_root(&mut self) {
         info!("Legacy SAR Init");
-        self.prepare_data();
+        if MAGISK_CPP_INIT {
+            self.prepare_data_cpp();
+        } else {
+            self.prepare_data();
+        }
         let is_two_stage = self.mount_system_root();
         if is_two_stage {
             hexpatch_init_for_second_stage(false);
@@ -82,7 +91,11 @@ impl MagiskInit {
 
     fn rootfs(&mut self) {
         info!("RootFS Init");
-        self.prepare_data();
+        if MAGISK_CPP_INIT {
+            self.prepare_data_cpp();
+        } else {
+            self.prepare_data();
+        }
         self.restore_ramdisk_init();
         self.patch_rw_root();
     }
@@ -160,7 +173,11 @@ impl MagiskInit {
         }
 
         // Finally execute the original init
-        self.exec_init();
+        if MAGISK_CPP_INIT {
+            self.exec_init_cpp();
+        } else {
+            self.exec_init();
+        }
 
         Ok(())
     }

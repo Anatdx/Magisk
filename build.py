@@ -312,6 +312,8 @@ def dump_flag_header():
     flag_txt += f'#define MAGISK_VERSION      "{config["version"]}"\n'
     flag_txt += f'#define MAGISK_VER_CODE     {config["versionCode"]}\n'
     flag_txt += f"#define MAGISK_DEBUG        {0 if args.release else 1}\n"
+    # Migration toggles (default off; used to keep production behavior stable)
+    flag_txt += "#define MAGISK_CPP_INIT     0\n"
 
     native_gen_path = Path("native", "out", "generated")
     native_gen_path.mkdir(mode=0o755, parents=True, exist_ok=True)
@@ -319,6 +321,7 @@ def dump_flag_header():
 
     rust_flag_txt = f'pub const MAGISK_VERSION: &str = "{config["version"]}";\n'
     rust_flag_txt += f'pub const MAGISK_VER_CODE: i32 = {config["versionCode"]};\n'
+    rust_flag_txt += "pub const MAGISK_CPP_INIT: bool = false;\n"
     write_if_diff(native_gen_path / "flags.rs", rust_flag_txt)
 
 
@@ -353,7 +356,8 @@ def build_native():
     header("* Building: " + " ".join(targets))
 
     dump_flag_header()
-    build_rust_src(targets)
+    if not getattr(args, "skip_rust", False):
+        build_rust_src(targets)
     build_cpp_src(targets)
 
 
@@ -825,6 +829,11 @@ def parse_args():
         nargs="*",
         help=f"{', '.join(support_targets)}, \
         or empty for defaults ({', '.join(default_targets)})",
+    )
+    native_parser.add_argument(
+        "--skip-rust",
+        action="store_true",
+        help="skip building Rust static libraries (useful during C++ migration)",
     )
 
     app_parser = subparsers.add_parser("app", help="build the Magisk app")
