@@ -7,6 +7,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -80,12 +81,55 @@ enum class MntNsMode : int32_t {
     Isolate = 2,
 };
 
+namespace DenyRequest {
+enum : int32_t {
+    ENFORCE = 0,
+    DISABLE = 1,
+    ADD = 2,
+    REMOVE = 3,
+    LIST = 4,
+    STATUS = 5,
+    END = 6,
+};
+}
+
+namespace DenyResponse {
+enum : int32_t {
+    OK = 0,
+    ENFORCED = 1,
+    NOT_ENFORCED = 2,
+    ITEM_EXIST = 3,
+    ITEM_NOT_EXIST = 4,
+    INVALID_PKG = 5,
+    NO_NS = 6,
+    ERROR = 7,
+    END = 8,
+};
+}
+
+namespace ZygiskRequest {
+enum : int32_t {
+    GetInfo = 0,
+    ConnectCompanion = 1,
+    GetModDir = 2,
+};
+}
+
+namespace ZygiskStateFlags {
+static constexpr uint32_t ProcessGrantedRoot = 0x00000001;
+static constexpr uint32_t ProcessOnDenyList = 0x00000002;
+static constexpr uint32_t DenyListEnforced = 0x40000000;
+static constexpr uint32_t ProcessIsMagiskApp = 0x80000000;
+}
+
 static constexpr int32_t AID_ROOT = 0;
 static constexpr int32_t AID_SHELL = 2000;
 static constexpr int32_t AID_USER_OFFSET = 100000;
 
 static inline int32_t to_app_id(int32_t uid) { return uid % AID_USER_OFFSET; }
 static inline int32_t to_user_id(int32_t uid) { return uid / AID_USER_OFFSET; }
+
+static std::atomic<bool> denylist_enforced{false};
 
 static bool is_valid_request(int32_t code) {
     if (code < 0 || code >= static_cast<int32_t>(RequestCode::END)) return false;
@@ -152,6 +196,10 @@ static std::string read_string(int fd) {
     return out;
 }
 
+static bool write_pod_u32(int fd, uint32_t v) {
+    return xwrite(fd, &v, sizeof(v)) == sizeof(v);
+}
+
 static std::string get_peer_context(int fd) {
 #ifdef SO_PEERSEC
     char buf[256] = {};
@@ -164,6 +212,141 @@ static std::string get_peer_context(int fd) {
 #endif
     (void)fd;
     return {};
+}
+
+static bool set_db_setting_i32(const char *key, int32_t value) {
+    return db_exec(
+        "INSERT OR REPLACE INTO settings (key,value) VALUES(?,?)",
+        DbArgs{key, static_cast<int64_t>(value)}
+    );
+}
+
+static bool denylist_row_exists(const std::string &pkg, const std::string &proc) {
+    bool exists = false;
+    auto cb = [&](StringSlice, const DbValues &) {
+        exists = true;
+    };
+    (void)db_exec(
+        "SELECT 1 FROM denylist WHERE package_name=? AND process=? LIMIT 1",
+        DbArgs{pkg.c_str(), proc.c_str()},
+        cb
+    );
+    return exists;
+}
+
+static int32_t denylist_enable() {
+    if (denylist_enforced.load(std::memory_order_relaxed)) {
+        (void)set_db_setting_i32("denylist", 1);
+        return DenyResponse::OK;
+    }
+    if (access("/proc/self/ns/mnt", F_OK) != 0) {
+        return DenyResponse::NO_NS;
+    }
+    denylist_enforced.store(true, std::memory_order_relaxed);
+    (void)set_db_setting_i32("denylist", 1);
+    return DenyResponse::OK;
+}
+
+static int32_t denylist_disable() {
+    denylist_enforced.store(false, std::memory_order_relaxed);
+    (void)set_db_setting_i32("denylist", 0);
+    return DenyResponse::OK;
+}
+
+static void handle_denylist_cmd(int fd) {
+    int32_t req = -1;
+    if (!read_pod_i32(fd, req)) return;
+    int32_t res = DenyResponse::ERROR;
+
+    switch (req) {
+        case DenyRequest::ENFORCE:
+            res = denylist_enable();
+            write_pod_i32(fd, res);
+            break;
+        case DenyRequest::DISABLE:
+            res = denylist_disable();
+            write_pod_i32(fd, res);
+            break;
+        case DenyRequest::STATUS:
+            res = denylist_enforced.load(std::memory_order_relaxed) ? DenyResponse::ENFORCED
+                                                                    : DenyResponse::NOT_ENFORCED;
+            write_pod_i32(fd, res);
+            break;
+        case DenyRequest::ADD: {
+            std::string pkg = read_string(fd);
+            std::string proc = read_string(fd);
+            if (proc.empty()) proc = pkg;
+            if (pkg.empty() || proc.empty()) {
+                write_pod_i32(fd, DenyResponse::INVALID_PKG);
+                break;
+            }
+            if (denylist_row_exists(pkg, proc)) {
+                write_pod_i32(fd, DenyResponse::ITEM_EXIST);
+                break;
+            }
+            bool ok = db_exec(
+                "INSERT OR IGNORE INTO denylist (package_name, process) VALUES (?,?)",
+                DbArgs{pkg.c_str(), proc.c_str()}
+            );
+            write_pod_i32(fd, ok ? DenyResponse::OK : DenyResponse::ERROR);
+            break;
+        }
+        case DenyRequest::REMOVE: {
+            std::string pkg = read_string(fd);
+            std::string proc = read_string(fd);
+            if (pkg.empty()) {
+                write_pod_i32(fd, DenyResponse::INVALID_PKG);
+                break;
+            }
+            if (proc.empty()) {
+                bool any = false;
+                auto cb = [&](StringSlice, const DbValues &) { any = true; };
+                (void)db_exec(
+                    "SELECT 1 FROM denylist WHERE package_name=? LIMIT 1",
+                    DbArgs{pkg.c_str()},
+                    cb
+                );
+                if (!any) {
+                    write_pod_i32(fd, DenyResponse::ITEM_NOT_EXIST);
+                    break;
+                }
+                bool ok = db_exec("DELETE FROM denylist WHERE package_name=?", DbArgs{pkg.c_str()});
+                write_pod_i32(fd, ok ? DenyResponse::OK : DenyResponse::ERROR);
+            } else {
+                if (!denylist_row_exists(pkg, proc)) {
+                    write_pod_i32(fd, DenyResponse::ITEM_NOT_EXIST);
+                    break;
+                }
+                bool ok = db_exec(
+                    "DELETE FROM denylist WHERE package_name=? AND process=?",
+                    DbArgs{pkg.c_str(), proc.c_str()}
+                );
+                write_pod_i32(fd, ok ? DenyResponse::OK : DenyResponse::ERROR);
+            }
+            break;
+        }
+        case DenyRequest::LIST: {
+            // Follow deny/utils.cpp framing: first a response int, then repeated (len+iobuf), ending with len=0.
+            write_pod_i32(fd, DenyResponse::OK);
+            auto cb = [&](StringSlice columns, const DbValues &values) {
+                const char *pkg = "";
+                const char *proc = "";
+                for (int i = 0; i < columns.size(); ++i) {
+                    if (columns[i] == "package_name") pkg = values.get_text(i);
+                    else if (columns[i] == "process") proc = values.get_text(i);
+                }
+                std::string out = std::string(pkg) + "|" + std::string(proc);
+                (void)write_string(fd, out);
+            };
+            (void)db_exec("SELECT package_name, process FROM denylist", {}, cb);
+            (void)write_string(fd, "");
+            break;
+        }
+        default:
+            // Unknown request code
+            write_pod_i32(fd, DenyResponse::ERROR);
+            break;
+    }
 }
 
 static void handle_sqlite_cmd(int fd) {
@@ -372,6 +555,78 @@ static bool eval_su_access(int32_t uid, SuPolicy &policy_out, MntNsMode &mntns_o
     return policy == SuPolicy::Allow || policy == SuPolicy::Restrict;
 }
 
+static bool uid_granted_root(int32_t uid) {
+    if (uid == AID_ROOT) return true;
+
+    // Root access gate
+    auto root_access = static_cast<RootAccess>(db_get_setting_i32("root_access",
+        static_cast<int32_t>(RootAccess::AppsAndAdb)));
+    switch (root_access) {
+        case RootAccess::Disabled:
+            return false;
+        case RootAccess::AppsOnly:
+            if (uid == AID_SHELL) return false;
+            break;
+        case RootAccess::AdbOnly:
+            if (uid != AID_SHELL) return false;
+            break;
+        case RootAccess::AppsAndAdb:
+        default:
+            break;
+    }
+
+    // Multiuser evaluation
+    auto multiuser = static_cast<MultiuserMode>(db_get_setting_i32("multiuser_mode",
+        static_cast<int32_t>(MultiuserMode::OwnerOnly)));
+    int32_t eval_uid = uid;
+    switch (multiuser) {
+        case MultiuserMode::OwnerOnly:
+            if (to_user_id(uid) != 0) return false;
+            eval_uid = uid;
+            break;
+        case MultiuserMode::OwnerManaged:
+            eval_uid = to_app_id(uid);
+            break;
+        case MultiuserMode::User:
+        default:
+            eval_uid = uid;
+            break;
+    }
+
+    auto pol = db_get_su_policy_for_uid(eval_uid);
+    return pol == SuPolicy::Allow || pol == SuPolicy::Restrict;
+}
+
+static void handle_zygisk_cmd(int fd) {
+    int32_t req = -1;
+    if (!read_pod_i32(fd, req)) return;
+
+    if (req != ZygiskRequest::GetInfo) {
+        // Bring-up: only support GetInfo now.
+        return;
+    }
+
+    int32_t uid = -1;
+    if (!read_pod_i32(fd, uid)) return;
+    std::string process = read_string(fd);
+    uint8_t is64 = 0;
+    if (!read_u8(fd, is64)) return;
+
+    uint32_t flags = 0;
+    if (uid_granted_root(uid)) {
+        flags |= ZygiskStateFlags::ProcessGrantedRoot;
+    }
+    if (denylist_enforced.load(std::memory_order_relaxed)) {
+        flags |= ZygiskStateFlags::DenyListEnforced;
+    }
+    // TODO: ProcessOnDenyList and ProcessIsMagiskApp parity.
+
+    (void)is64;
+    (void)process;
+
+    write_pod_u32(fd, flags);
+}
+
 static void set_identity(int uid, const std::vector<uint32_t> &groups) {
     gid_t gid = static_cast<gid_t>(uid);
     if (!groups.empty()) {
@@ -502,7 +757,14 @@ static void handle_client(int cfd) {
         case RequestCode::CHECK_VERSION: {
             // Keep compatible shape, but not necessarily identical content yet.
 #ifdef MAGISK_VERSION
+            // Match Rust daemon string format:
+            //   debug:   "<ver>:MAGISK:D"
+            //   release: "<ver>:MAGISK:R"
+#ifdef MAGISK_DEBUG
+            std::string s = std::string(MAGISK_VERSION) + (MAGISK_DEBUG ? ":MAGISK:D" : ":MAGISK:R");
+#else
             std::string s = std::string(MAGISK_VERSION) + ":MAGISK:CPP";
+#endif
 #else
             std::string s = "unknown:MAGISK:CPP";
 #endif
@@ -527,6 +789,14 @@ static void handle_client(int cfd) {
             handle_sqlite_cmd(cfd);
             break;
         }
+        case RequestCode::DENYLIST: {
+            handle_denylist_cmd(cfd);
+            break;
+        }
+        case RequestCode::ZYGISK: {
+            handle_zygisk_cmd(cfd);
+            break;
+        }
         case RequestCode::SUPERUSER: {
             SuRequestCpp req{};
             if (!read_su_request(cfd, req)) {
@@ -541,6 +811,10 @@ static void handle_client(int cfd) {
             if (!allowed) {
                 write_pod_i32(cfd, static_cast<int32_t>(SuPolicy::Deny));
                 break;
+            }
+
+            if (policy == SuPolicy::Restrict) {
+                req.drop_cap = true;
             }
 
             // ack success
