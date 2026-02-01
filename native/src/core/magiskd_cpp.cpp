@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <fcntl.h>
 #include <grp.h>
 #include <poll.h>
@@ -140,6 +141,23 @@ struct ExeAttr {
 };
 
 static ExeAttr g_self_exe{};
+
+static uint64_t now_ms_monotonic() {
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000ULL + static_cast<uint64_t>(ts.tv_nsec) / 1000000ULL;
+}
+
+struct CachedSuInfo {
+    int32_t uid = -1;
+    int32_t eval_uid = -1;
+    RootSettingsCpp settings{};
+    MntNsMode mntns = MntNsMode::Requester;
+    uint64_t ts_ms = 0;
+};
+
+static pthread_mutex_t g_su_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+static CachedSuInfo g_su_cache{};
 
 static bool is_valid_request(int32_t code) {
     if (code < 0 || code >= static_cast<int32_t>(RequestCode::END)) return false;
@@ -565,6 +583,69 @@ static int32_t get_package_uid_guess(int32_t user, const std::string &pkg) {
     return -1;
 }
 
+static std::vector<bool> get_installed_app_no_list() {
+    // app_id range: [AID_APP_START..AID_APP_END] => app_no [0..9999]
+    constexpr int32_t AID_APP_START = 10000;
+    constexpr int32_t AID_APP_END = 19999;
+
+    std::vector<bool> present(10000, false);
+
+    auto scan_root = [&](const char *root) {
+        auto users = xopen_dir(root);
+        if (!users) return;
+        for (dirent *ue; (ue = readdir(users.get()));) {
+            int user = parse_int(ue->d_name);
+            if (user < 0) continue;
+            std::string user_dir = std::string(root) + "/" + ue->d_name;
+            auto pkgs = xopen_dir(user_dir.c_str());
+            if (!pkgs) continue;
+            int dirfd_user = dirfd(pkgs.get());
+            for (dirent *pe; (pe = readdir(pkgs.get()));) {
+                if (pe->d_name[0] == '.') continue;
+                struct stat st{};
+                if (fstatat(dirfd_user, pe->d_name, &st, 0) != 0) continue;
+                int32_t app_id = to_app_id(static_cast<int32_t>(st.st_uid));
+                if (app_id >= AID_APP_START && app_id <= AID_APP_END) {
+                    int32_t app_no = app_id - AID_APP_START;
+                    if (app_no >= 0 && app_no < static_cast<int32_t>(present.size())) {
+                        present[static_cast<size_t>(app_no)] = true;
+                    }
+                }
+            }
+        }
+    };
+
+    // Try both paths; different Android versions use either.
+    scan_root("/data/user_de");
+    scan_root("/data/user");
+
+    return present;
+}
+
+static void prune_su_policies() {
+    // Rough parity with Rust prune_su_access(): remove policies for uninstalled app IDs.
+    constexpr int32_t AID_APP_START = 10000;
+    constexpr int32_t AID_APP_END = 19999;
+
+    std::vector<int32_t> uids;
+    auto cb = [&](StringSlice, const DbValues &v) {
+        uids.push_back(v.get_int(0));
+    };
+    (void)db_exec("SELECT uid FROM policies", {}, cb);
+
+    auto present = get_installed_app_no_list();
+
+    for (auto uid : uids) {
+        int32_t app_id = to_app_id(uid);
+        if (app_id < AID_APP_START || app_id > AID_APP_END) continue;
+        int32_t app_no = app_id - AID_APP_START;
+        if (app_no < 0 || app_no >= static_cast<int32_t>(present.size())) continue;
+        if (!present[static_cast<size_t>(app_no)]) {
+            (void)db_exec("DELETE FROM policies WHERE uid=?", DbArgs{static_cast<int64_t>(uid)});
+        }
+    }
+}
+
 static std::pair<int32_t, std::string> get_manager_for_user(int32_t user, bool /*install*/) {
     // Bring-up: only use DB string + package uid heuristic (no signature checks / stub install).
     std::string pkg = db_get_string_value("requester");
@@ -801,6 +882,21 @@ static bool eval_su_access(
     MntNsMode &mntns_out,
     int32_t pid
 ) {
+    // 3-second freshness cache (match Rust).
+    {
+        mutex_guard lock(g_su_cache_lock);
+        uint64_t now = now_ms_monotonic();
+        if (g_su_cache.uid == uid && (now - g_su_cache.ts_ms) < 3000) {
+            settings_out = g_su_cache.settings;
+            mntns_out = g_su_cache.mntns;
+            // Still perform log/notify as Rust does on each request (best-effort).
+            auto [mgr_uid, mgr_pkg] = get_manager_for_user(to_user_id(g_su_cache.eval_uid), true);
+            (void)mgr_uid;
+            su_log_notify_async(settings_out, mgr_pkg, to_user_id(g_su_cache.eval_uid), uid, pid, req);
+            return settings_out.policy == SuPolicy::Allow || settings_out.policy == SuPolicy::Restrict;
+        }
+    }
+
     if (uid == AID_ROOT) {
         settings_out.policy = SuPolicy::Allow;
         mntns_out = MntNsMode::Requester;
@@ -854,6 +950,17 @@ static bool eval_su_access(
 
     settings_out = settings;
     mntns_out = mntns;
+
+    // Update cache
+    {
+        mutex_guard lock(g_su_cache_lock);
+        g_su_cache.uid = uid;
+        g_su_cache.eval_uid = eval_uid;
+        g_su_cache.settings = settings_out;
+        g_su_cache.mntns = mntns_out;
+        g_su_cache.ts_ms = now_ms_monotonic();
+    }
+
     return settings.policy == SuPolicy::Allow || settings.policy == SuPolicy::Restrict;
 }
 
@@ -1096,6 +1203,11 @@ static void handle_client(int cfd) {
         }
         case RequestCode::ZYGISK: {
             handle_zygisk_cmd(cfd);
+            break;
+        }
+        case RequestCode::ZYGOTE_RESTART: {
+            // Bring-up: perform core maintenance work.
+            prune_su_policies();
             break;
         }
         case RequestCode::SUPERUSER: {
