@@ -27,7 +27,7 @@ void MagiskInit::prepare_data_cpp() const noexcept {
     (void)cp_afc("/overlay.d", "/data/overlay.d");
 }
 
-[[noreturn]] void MagiskInit::exec_init_cpp() noexcept {
+void MagiskInit::exec_init_cpp() noexcept {
     LOGD("init-cpp: exec_init_cpp\n");
 
     // Unmount in reverse order
