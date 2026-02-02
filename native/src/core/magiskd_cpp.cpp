@@ -1409,6 +1409,50 @@ static void handle_client(int cfd) {
 
 extern "C" int magiskd_cpp_entry() {
 
+    // ---------------------------------------------------------------------
+    // Bring-up parity with Rust daemon_entry():
+    // - set nice name / start logging
+    // - detach session + swap stdio
+    // - enter magisk proc context so we can access /data/* consistently
+
+    set_nice_name(Utf8CStr("magiskd"));
+    cmdline_logging();
+
+    // Block all signals (best-effort)
+    {
+        sigset_t set;
+        sigfillset(&set);
+        (void)pthread_sigmask(SIG_SETMASK, &set, nullptr);
+    }
+
+    // Swap out stdio
+    {
+        int nullfd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        if (nullfd >= 0) {
+            (void)dup2(nullfd, STDOUT_FILENO);
+            (void)dup2(nullfd, STDERR_FILENO);
+            close(nullfd);
+        }
+        int zerofd = open("/dev/zero", O_RDONLY | O_CLOEXEC);
+        if (zerofd >= 0) {
+            (void)dup2(zerofd, STDIN_FILENO);
+            close(zerofd);
+        }
+    }
+
+    (void)setsid();
+
+    // Make sure current SELinux context is magisk
+    {
+        int fd = open("/proc/self/attr/current", O_WRONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            const char con[] = MAGISK_PROC_CON;
+            // Rust writes the NUL terminator too; do the same.
+            (void)xwrite(fd, con, sizeof(con));
+            close(fd);
+        }
+    }
+
     // Capture self /proc/self/exe dev+ino for client validation
     {
         struct stat st{};
