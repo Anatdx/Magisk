@@ -363,7 +363,12 @@ void MagiskInit::patch_rw_root() noexcept {
         patch_fissiond("/sbin");
 
     xmkdir(PRE_TMPSRC, 0);
-    xmount("tmpfs", PRE_TMPSRC, "tmpfs", 0, "mode=755");
+    // IMPORTANT: `magisk` will be extracted onto this tmpfs, and later MS_MOVE'd to /sbin.
+    // If the tmpfs is left as default `tmpfs` label, untrusted apps will be denied executing
+    // the `magisk` binary (used as `su` applet), breaking libsu and CI tests.
+    char tmpfs_opts[256]{};
+    ssprintf(tmpfs_opts, sizeof(tmpfs_opts), "mode=755,context=%s", MAGISK_FILE_CON);
+    xmount("tmpfs", PRE_TMPSRC, "tmpfs", 0, tmpfs_opts);
     xmkdir(PRE_TMPDIR, 0);
     setup_tmp(PRE_TMPDIR);
     chdir(PRE_TMPDIR);

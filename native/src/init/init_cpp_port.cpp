@@ -2,6 +2,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <string>
 
 #include <base.hpp>
 #include <consts.hpp>
@@ -20,7 +21,13 @@ void MagiskInit::prepare_data_cpp() const noexcept {
     // - copy /init, /.backup, /overlay.d into /data for later stages
     xmkdir("/data", 0755);
     // Ignore failure here; Rust side also logs and continues.
-    mount("magisk", "/data", "tmpfs", 0, "mode=755");
+    // Keep tmpfs labeled as Magisk file type so later bind/move mounts (e.g. /sbin on tmpfs)
+    // don't end up as `u:object_r:tmpfs:s0`, which would prevent untrusted_app from exec'ing
+    // the `magisk` binary used for the `su` applet.
+    {
+        std::string opts = std::string("mode=755,context=") + MAGISK_FILE_CON;
+        mount("magisk", "/data", "tmpfs", 0, opts.c_str());
+    }
 
     (void)cp_afc("/init", "/data/magiskinit");
     (void)cp_afc("/.backup", "/data/.backup");
