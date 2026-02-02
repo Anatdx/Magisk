@@ -601,6 +601,45 @@ static std::string db_get_string_value(const char *key) {
 }
 
 static int32_t get_package_uid_guess(int32_t user, const std::string &pkg) {
+    // Prefer querying system package list so it works even before app data dirs exist.
+    // Format: "<package> <uid> <...>" per line.
+    {
+        std::string pl = full_read("/data/system/packages.list");
+        if (!pl.empty()) {
+            size_t off = 0;
+            while (off < pl.size()) {
+                size_t eol = pl.find('\n', off);
+                if (eol == std::string::npos) eol = pl.size();
+                std::string_view line(pl.data() + off, eol - off);
+                off = (eol == pl.size()) ? eol : eol + 1;
+
+                // Trim left spaces
+                while (!line.empty() && std::isspace(static_cast<unsigned char>(line.front()))) {
+                    line.remove_prefix(1);
+                }
+                if (line.empty()) continue;
+
+                // Must start with exact package name + whitespace
+                if (line.size() <= pkg.size()) continue;
+                if (line.compare(0, pkg.size(), pkg) != 0) continue;
+                if (!std::isspace(static_cast<unsigned char>(line[pkg.size()]))) continue;
+
+                size_t pos = pkg.size();
+                while (pos < line.size() && std::isspace(static_cast<unsigned char>(line[pos]))) ++pos;
+                size_t start = pos;
+                while (pos < line.size() && !std::isspace(static_cast<unsigned char>(line[pos]))) ++pos;
+                if (start == pos) continue;
+
+                // packages.list uid is per-app-id (user 0). Convert to per-user uid.
+                int32_t uid0 = parse_int(std::string(line.substr(start, pos - start)).c_str());
+                if (uid0 > 0) {
+                    int32_t app_id = to_app_id(uid0);
+                    return user * AID_USER_OFFSET + app_id;
+                }
+            }
+        }
+    }
+
     struct stat st{};
     // Try both /data/user_de and /data/user
     {
