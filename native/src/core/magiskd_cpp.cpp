@@ -159,6 +159,16 @@ struct CachedSuInfo {
 static pthread_mutex_t g_su_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 static CachedSuInfo g_su_cache{};
 
+enum BootStateBits : uint32_t {
+    BootPostFsDataDone = 1u << 0,
+    BootLateStartDone  = 1u << 1,
+    BootCompleteDone   = 1u << 2,
+    BootSafeMode       = 1u << 3,
+};
+
+static pthread_mutex_t g_boot_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t g_boot_state = 0;
+
 static bool is_valid_request(int32_t code) {
     if (code < 0 || code >= static_cast<int32_t>(RequestCode::END)) return false;
     if (code == static_cast<int32_t>(RequestCode::_SYNC_BARRIER_)) return false;
@@ -262,10 +272,145 @@ static bool set_db_setting_i32(const char *key, int32_t value) {
     );
 }
 
+static int32_t db_get_setting_i32(const char *key, int32_t def);
+
 static void init_denylist_state_from_db() {
     // settings key matches DbEntryKey::DenylistConfig -> "denylist"
     const int32_t v = db_get_setting_i32("denylist", 0);
     denylist_enforced.store(v != 0, std::memory_order_relaxed);
+}
+
+static bool check_data_mounted_ready() {
+    auto fp = xopen_file("/proc/mounts", "re");
+    if (!fp) return false;
+    char line[4096];
+    while (fgets(line, sizeof(line), fp.get())) {
+        if (strstr(line, " /data ") && !strstr(line, " tmpfs ")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const char *bbpath() {
+    static std::string path;
+    path = std::string(detect_magisk_tmp()) + "/" BBPATH "/busybox";
+    if (access(path.c_str(), X_OK) != 0) {
+        path = DATABIN "/busybox";
+    }
+    return path.c_str();
+}
+
+static void set_script_env_min() {
+    setenv("ASH_STANDALONE", "1", 1);
+    char new_path[4096];
+    const char *old = getenv("PATH");
+    if (!old) old = "";
+    ssprintf(new_path, sizeof(new_path), "%s:%s", old, detect_magisk_tmp());
+    setenv("PATH", new_path, 1);
+}
+
+static void exec_script_file_async(const char *path) {
+    exec_t exec{
+        .pre_exec = set_script_env_min,
+        .fork = fork_dont_care,
+    };
+    exec_command(exec, bbpath(), "sh", path);
+}
+
+static void exec_common_scripts_cpp(const char *stage) {
+    char dir_path[256];
+    ssprintf(dir_path, sizeof(dir_path), SECURE_DIR "/%s.d", stage);
+    auto dir = xopen_dir(dir_path);
+    if (!dir) return;
+
+    int dfd = dirfd(dir.get());
+    for (dirent *entry; (entry = xreaddir(dir.get()));) {
+        if (entry->d_type != DT_REG) continue;
+        if (faccessat(dfd, entry->d_name, X_OK, 0) != 0) continue;
+        char full[512];
+        ssprintf(full, sizeof(full), "%s/%s", dir_path, entry->d_name);
+        exec_script_file_async(full);
+    }
+}
+
+static void exec_module_scripts_cpp(const char *stage) {
+    auto dir = xopen_dir(MODULEROOT);
+    if (!dir) return;
+    for (dirent *entry; (entry = xreaddir(dir.get()));) {
+        if (entry->d_type != DT_DIR) continue;
+        if (entry->d_name[0] == '.') continue;
+
+        char disable_path[512];
+        ssprintf(disable_path, sizeof(disable_path), MODULEROOT "/%s/disable", entry->d_name);
+        if (access(disable_path, F_OK) == 0) continue;
+
+        char script_path[512];
+        ssprintf(script_path, sizeof(script_path), MODULEROOT "/%s/%s.sh", entry->d_name, stage);
+        if (access(script_path, F_OK) != 0) continue;
+        exec_script_file_async(script_path);
+    }
+}
+
+static void disable_all_modules_cpp() {
+    auto dir = xopen_dir(MODULEROOT);
+    if (!dir) return;
+    for (dirent *entry; (entry = xreaddir(dir.get()));) {
+        if (entry->d_type != DT_DIR) continue;
+        if (entry->d_name[0] == '.') continue;
+        char disable_path[512];
+        ssprintf(disable_path, sizeof(disable_path), MODULEROOT "/%s/disable", entry->d_name);
+        int fd = open(disable_path, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+        if (fd >= 0) close(fd);
+    }
+}
+
+static void handle_boot_stage(RequestCode code) {
+    mutex_guard lock(g_boot_lock);
+
+    if (code == RequestCode::POST_FS_DATA) {
+        if ((g_boot_state & BootPostFsDataDone) != 0) return;
+        if (!check_data_mounted_ready()) return;
+
+        // Ensure /data/adb exists (best-effort bring-up).
+        (void)mkdir(SECURE_DIR, 0700);
+
+        int32_t boot_cnt = db_get_setting_i32("bootloop", 0);
+        (void)set_db_setting_i32("bootloop", boot_cnt + 1);
+
+        const bool safe_mode = boot_cnt >= 2;
+        if (safe_mode) {
+            g_boot_state |= BootSafeMode;
+            disable_all_modules_cpp();
+            (void)set_db_setting_i32("zygisk", 0);
+        } else {
+            exec_common_scripts_cpp("post-fs-data");
+            exec_module_scripts_cpp("post-fs-data");
+        }
+
+        init_denylist_state_from_db();
+        g_boot_state |= BootPostFsDataDone;
+        return;
+    }
+
+    if (code == RequestCode::LATE_START) {
+        if ((g_boot_state & BootPostFsDataDone) == 0) return;
+        if ((g_boot_state & BootSafeMode) != 0) return;
+        if ((g_boot_state & BootLateStartDone) != 0) return;
+        exec_common_scripts_cpp("service");
+        exec_module_scripts_cpp("service");
+        g_boot_state |= BootLateStartDone;
+        return;
+    }
+
+    if (code == RequestCode::BOOT_COMPLETE) {
+        if ((g_boot_state & BootPostFsDataDone) == 0) return;
+        if ((g_boot_state & BootCompleteDone) != 0) return;
+        (void)set_db_setting_i32("bootloop", 0);
+        g_boot_state |= BootCompleteDone;
+        (void)get_manager_for_user(0, true);
+        return;
+    }
 }
 
 static bool denylist_row_exists(const std::string &pkg, const std::string &proc) {
@@ -1208,6 +1353,12 @@ static void handle_client(int cfd) {
         case RequestCode::ZYGOTE_RESTART: {
             // Bring-up: perform core maintenance work.
             prune_su_policies();
+            break;
+        }
+        case RequestCode::POST_FS_DATA:
+        case RequestCode::LATE_START:
+        case RequestCode::BOOT_COMPLETE: {
+            handle_boot_stage(static_cast<RequestCode>(code));
             break;
         }
         case RequestCode::SUPERUSER: {
