@@ -75,9 +75,10 @@ void SuRequest::write_to_fd(int32_t fd) const noexcept {
     write_any<uint8_t>(fd, login ? 1 : 0);
     write_any<uint8_t>(fd, keep_env ? 1 : 0);
     write_any<uint8_t>(fd, drop_cap ? 1 : 0);
-    write_string(fd, shell.c_str());
-    write_string(fd, command.c_str());
-    write_string(fd, context.c_str());
+    // `rust::String::c_str()` is non-const; use data/size instead.
+    write_string(fd, std::string_view(shell.data(), shell.size()));
+    write_string(fd, std::string_view(command.data(), command.size()));
+    write_string(fd, std::string_view(context.data(), context.size()));
     write_any<int32_t>(fd, static_cast<int32_t>(gids.size()));
     for (auto g : gids) {
         write_any<uint32_t>(fd, g);
@@ -307,7 +308,7 @@ void pump_tty(int32_t ptmx, bool pump_stdin) noexcept {
 
 int switch_mnt_ns(int pid) {
     char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/ns/mnt", pid);
+    ssprintf(path, sizeof(path), "/proc/%d/ns/mnt", pid);
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return -1;
     int r = setns(fd, 0);
@@ -482,7 +483,7 @@ int32_t magisk_main(int32_t argc, char **argv) noexcept {
     }
 
     if (a1 == "--list") {
-        for (const char **p = applet_names; p && *p; ++p) {
+        for (const char *const *p = applet_names; p && *p; ++p) {
             printf("%s\n", *p);
         }
         return 0;

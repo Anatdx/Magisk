@@ -148,6 +148,16 @@ static uint64_t now_ms_monotonic() {
     return static_cast<uint64_t>(ts.tv_sec) * 1000ULL + static_cast<uint64_t>(ts.tv_nsec) / 1000000ULL;
 }
 
+// Must be defined before CachedSuInfo (it is stored by value).
+struct RootSettingsCpp {
+    SuPolicy policy = SuPolicy::Query;
+    bool log = false;
+    bool notify = false;
+};
+
+// Forward declarations for helpers referenced earlier in the file.
+static std::pair<int32_t, std::string> get_manager_for_user(int32_t user, bool install);
+
 struct CachedSuInfo {
     int32_t uid = -1;
     int32_t eval_uid = -1;
@@ -678,12 +688,6 @@ static int32_t db_get_setting_i32(const char *key, int32_t def) {
     return out;
 }
 
-struct RootSettingsCpp {
-    SuPolicy policy = SuPolicy::Query;
-    bool log = false;
-    bool notify = false;
-};
-
 static RootSettingsCpp db_get_root_settings_for_uid(int32_t uid) {
     RootSettingsCpp out{};
     auto cb = [&](StringSlice columns, const DbValues &v) {
@@ -1147,8 +1151,8 @@ static bool uid_granted_root(int32_t uid) {
             break;
     }
 
-    auto pol = db_get_su_policy_for_uid(eval_uid);
-    return pol == SuPolicy::Allow || pol == SuPolicy::Restrict;
+    auto settings = db_get_root_settings_for_uid(eval_uid);
+    return settings.policy == SuPolicy::Allow || settings.policy == SuPolicy::Restrict;
 }
 
 static void handle_zygisk_cmd(int fd) {
