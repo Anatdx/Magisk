@@ -1468,7 +1468,21 @@ extern "C" int magiskd_cpp_entry() {
     init_denylist_state_from_db();
 
     // Ensure directory exists: <tmp> + DEVICEDIR (".magisk/device")
-    mkdirs(sock_dir().c_str(), 0755);
+    // NOTE: These directories are expected to be traversable by clients (MagiskSU)
+    // and should carry Magisk file context, otherwise untrusted apps may not be
+    // able to connect even when the socket itself is labeled.
+    mkdirs(sock_dir().c_str(), 0711);
+    {
+        std::string tmp = detect_magisk_tmp();
+        if (!tmp.empty()) {
+            std::string intl = tmp + "/" INTLROOT;      // ".magisk"
+            std::string devd = tmp + "/" DEVICEDIR;     // ".magisk/device"
+            (void)chmod(intl.c_str(), 0711);
+            (void)chmod(devd.c_str(), 0711);
+            (void)lsetxattr(intl.c_str(), "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON), 0);
+            (void)lsetxattr(devd.c_str(), "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON), 0);
+        }
+    }
 
     auto path = sock_path();
     // Remove stale socket if any
