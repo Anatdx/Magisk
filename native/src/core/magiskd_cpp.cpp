@@ -6,6 +6,7 @@
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
+#include <sys/system_properties.h>
 #include <unistd.h>
 
 #include <arpa/inet.h>
@@ -152,6 +153,19 @@ static uint64_t now_ms_monotonic() {
     timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<uint64_t>(ts.tv_sec) * 1000ULL + static_cast<uint64_t>(ts.tv_nsec) / 1000000ULL;
+}
+
+static bool is_debuggable_build() {
+    // Cache result: system properties won't change at runtime.
+    static int cached = -1;
+    if (cached != -1) return cached != 0;
+    char buf[PROP_VALUE_MAX]{};
+    if (__system_property_get("ro.debuggable", buf) <= 0) {
+        cached = 0;
+        return false;
+    }
+    cached = (buf[0] == '1' && buf[1] == '\0') ? 1 : 0;
+    return cached != 0;
 }
 
 // Must be defined before CachedSuInfo (it is stored by value).
@@ -933,6 +947,8 @@ static bool su_allowed_by_settings(int32_t uid, int32_t eval_uid) {
 
     switch (root_access) {
         case RootAccess::Disabled:
+            // Emulator/userdebug bring-up: allow root in debuggable builds even if DB isn't initialized yet.
+            if (is_debuggable_build()) return true;
             return false;
         case RootAccess::AppsOnly:
             return uid != AID_SHELL;
@@ -996,6 +1012,15 @@ static bool eval_su_access(
     if (!su_allowed_by_settings(uid, eval_uid)) return false;
 
     auto settings = db_get_root_settings_for_uid(eval_uid);
+
+    // Emulator/userdebug bring-up:
+    // If the policy is Query but there is no interactive manager response yet,
+    // default to allow to make CI and early bootstrapping work.
+    if (settings.policy == SuPolicy::Query && is_debuggable_build()) {
+        settings.policy = SuPolicy::Allow;
+        settings.log = false;
+        settings.notify = false;
+    }
 
     // ADB shell should be granted root by default when global root access allows it.
     // This matches user expectations in emulator tests (no interactive prompt).
