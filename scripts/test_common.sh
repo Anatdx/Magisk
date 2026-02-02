@@ -84,6 +84,14 @@ run_setup() {
   local variant=$1
   adb shell 'PATH=$PATH:/debug_ramdisk magisk -v'
 
+  # Diagnostics: CI root bring-up is sensitive; print su availability and key props.
+  adb shell 'echo "[diag] ro.debuggable=$(getprop ro.debuggable) ro.secure=$(getprop ro.secure)"; \
+    echo "[diag] PATH=$PATH"; \
+    echo "[diag] su_path=$(command -v su 2>/dev/null || echo none)"; \
+    ls -l /system/bin/su /system/xbin/su /sbin/su /debug_ramdisk/su 2>/dev/null || true; \
+    ls -l /sbin/magisk /debug_ramdisk/magisk 2>/dev/null || true'
+  adb shell 'su -c id 2>&1 || true'
+
   # Install the Magisk app
   adb install -r -g out/app-${variant}.apk
 

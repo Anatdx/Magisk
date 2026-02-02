@@ -161,7 +161,8 @@ static bool is_debuggable_build() {
     if (cached != -1) return cached != 0;
     char buf[PROP_VALUE_MAX]{};
     if (__system_property_get("ro.debuggable", buf) <= 0) {
-        cached = 0;
+        // Do NOT permanently cache "unavailable". During early boot property area
+        // may not be ready yet; retry later to avoid breaking CI bring-up.
         return false;
     }
     cached = (buf[0] == '1' && buf[1] == '\0') ? 1 : 0;
