@@ -214,14 +214,14 @@ static const char *detect_magisk_tmp() {
 static std::string sock_path() {
     // Keep identical to Rust daemon path:
     //   join_path(get_magisk_tmp()).join_path(MAIN_SOCKET)
-    return std::string(detect_magisk_tmp()) + MAIN_SOCKET;
+    return std::string(detect_magisk_tmp()) + "/" + MAIN_SOCKET;
 }
 
 static std::string sock_dir() {
     // MAIN_SOCKET = DEVICEDIR "/socket"
     // DEVICEDIR   = INTLROOT "/device"
     // INTLROOT    = ".magisk"
-    return std::string(detect_magisk_tmp()) + DEVICEDIR;
+    return std::string(detect_magisk_tmp()) + "/" + DEVICEDIR;
 }
 
 static bool write_pod_i32(int fd, int32_t v) {
