@@ -11,15 +11,15 @@ LOCAL_MODULE := magisk
 LOCAL_STATIC_LIBRARIES := \
     libbase \
     libsystemproperties \
-    liblsplt \
-    libmagisk-rs
+    liblsplt
 
 LOCAL_SRC_FILES := \
     core/applets.cpp \
     core/scripting.cpp \
     core/sqlite.cpp \
     core/utils.cpp \
-    core/core-rs.cpp \
+    core/magiskd_cpp.cpp \
+    core/core-compat.cpp \
     core/resetprop/sys.cpp \
     core/su/su.cpp \
     core/zygisk/entry.cpp \
@@ -49,6 +49,8 @@ LOCAL_SRC_FILES := \
 
 LOCAL_C_INCLUDES := \
     $(LOCAL_PATH)/core/include
+
+LOCAL_CFLAGS += -DMAGISKD_CPP_STANDALONE
 
 LOCAL_LDLIBS := -llog
 
@@ -138,13 +140,15 @@ include $(CLEAR_VARS)
 LOCAL_MODULE := resetprop
 LOCAL_STATIC_LIBRARIES := \
     libbase \
-    libsystemproperties \
-    libmagisk-rs
+    libsystemproperties
 
 LOCAL_SRC_FILES := \
     core/applet_stub.cpp \
     core/resetprop/sys.cpp \
-    core/core-rs.cpp
+    core/core-compat.cpp
+
+LOCAL_C_INCLUDES := \
+    $(LOCAL_PATH)/core/include
 
 LOCAL_CFLAGS := -DAPPLET_STUB_MAIN=resetprop_main
 include $(BUILD_EXECUTABLE)

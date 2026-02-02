@@ -1410,9 +1410,7 @@ static void handle_client(int cfd) {
 
 } // namespace
 
-int main(int argc, char *argv[]) {
-    (void)argc;
-    (void)argv;
+extern "C" int magiskd_cpp_entry() {
 
     // Capture self /proc/self/exe dev+ino for client validation
     {
@@ -1474,4 +1472,13 @@ int main(int argc, char *argv[]) {
         close(cfd);
     }
 }
+
+// Standalone entrypoint for the optional `magiskd-cpp` binary build.
+#ifdef MAGISKD_CPP_STANDALONE
+int main(int argc, char *argv[]) {
+    (void)argc;
+    (void)argv;
+    return magiskd_cpp_entry();
+}
+#endif
 

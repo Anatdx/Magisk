@@ -78,7 +78,8 @@ abi_alias = {
 default_abis = support_abis.keys() - {"riscv64"}
 support_targets = {"magisk", "magiskinit", "magiskboot", "magiskpolicy", "resetprop"}
 default_targets = support_targets - {"resetprop"}
-rust_targets = default_targets.copy()
+# Core has been migrated to C++ (no core Rust crate).
+rust_targets = default_targets.copy() - {"magisk"}
 clean_targets = {"native", "cpp", "rust", "app"}
 ondk_version = "r29.4"
 
@@ -197,7 +198,63 @@ def run_ndk_build(cmds: list[str]):
     os.chdir("..")
 
 
+def run_core_cmake(targets: set[str]):
+    # Build only core binaries (magisk/resetprop) via CMake, for all selected ABIs.
+    if not targets:
+        return
+
+    toolchain = Path(ndk_path, "build", "cmake", "android.toolchain.cmake")
+    if not toolchain.exists():
+        error(f"Missing CMake toolchain: {toolchain}")
+
+    build_type = "Release" if args.release else "Debug"
+
+    for abi in build_abis.keys():
+        out_dir = Path("native", "out", abi)
+        out_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+
+        bdir = Path("native", "obj", "cmake-core", abi, build_type.lower())
+        bdir.mkdir(mode=0o755, parents=True, exist_ok=True)
+
+        cfg_cmd = [
+            "cmake",
+            "-S",
+            str(Path("native", "src", "core")),
+            "-B",
+            str(bdir),
+            "-G",
+            "Ninja",
+            f"-DCMAKE_BUILD_TYPE={build_type}",
+            f"-DCMAKE_TOOLCHAIN_FILE={toolchain}",
+            f"-DANDROID_ABI={abi}",
+            "-DANDROID_PLATFORM=android-23",
+            "-DANDROID_STL=c++_static",
+            f"-DMAGISK_CMAKE_OUT_DIR={out_dir.resolve()}",
+        ]
+        if not args.release:
+            cfg_cmd.append("-DMAGISK_DEBUG=1")
+
+        proc = execv(cfg_cmd)
+        if proc.returncode != 0:
+            error("CMake configure failed!")
+
+        build_cmd = ["cmake", "--build", str(bdir)]
+        for t in sorted(targets):
+            build_cmd.extend(["--target", t])
+        proc = execv(build_cmd)
+        if proc.returncode != 0:
+            error("CMake build failed!")
+
+
 def build_cpp_src(targets: set[str]):
+    # Optional core-only CMake path (magisk/resetprop).
+    core_cmake_targets = set()
+    core_cmake_clean = False
+    if getattr(args, "core_cmake", False):
+        core_cmake_targets = targets & {"magisk", "resetprop"}
+        core_cmake_clean = "magisk" in core_cmake_targets
+        targets = targets - core_cmake_targets
+
     cmds = []
     clean = False
 
@@ -219,6 +276,9 @@ def build_cpp_src(targets: set[str]):
         run_ndk_build(cmds)
         collect_ndk_build()
 
+    if core_cmake_targets:
+        run_core_cmake(core_cmake_targets)
+
     cmds.clear()
 
     if "magiskinit" in targets:
@@ -233,6 +293,9 @@ def build_cpp_src(targets: set[str]):
         collect_ndk_build()
 
     if clean:
+        clean_elf()
+    if core_cmake_clean and not clean:
+        # `clean_elf()` expects outputs in native/out/* which CMake also uses.
         clean_elf()
 
 
@@ -253,8 +316,6 @@ def run_cargo(cmds: list[str]):
 
 def build_rust_src(targets: set[str]):
     targets = targets.copy()
-    if "resetprop" in targets:
-        targets.add("magisk")
     targets = targets & rust_targets
     if not targets:
         return
@@ -834,6 +895,11 @@ def parse_args():
         "--skip-rust",
         action="store_true",
         help="skip building Rust static libraries (useful during C++ migration)",
+    )
+    native_parser.add_argument(
+        "--core-cmake",
+        action="store_true",
+        help="build core (magisk/resetprop) via CMake (opt-in, core-only)",
     )
 
     app_parser = subparsers.add_parser("app", help="build the Magisk app")

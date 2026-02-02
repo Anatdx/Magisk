@@ -7,7 +7,7 @@
 
 #include <base.hpp>
 
-#include "../core-rs.hpp"
+#include "../core-compat.hpp"
 
 #define AID_ROOT   0
 #define AID_SHELL  2000
