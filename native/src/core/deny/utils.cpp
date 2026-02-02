@@ -222,9 +222,9 @@ static bool ensure_data() {
     LOGI("denylist: initializing internal data structures\n");
 
     default_new(pkg_to_procs_);
-    bool res = db_exec("SELECT * FROM denylist", {}, [](StringSlice columns, const DbValues &values) {
-        const char *package_name;
-        const char *process;
+    bool res = db_exec("SELECT * FROM denylist", {}, [](const ColumnList &columns, const DbValues &values) {
+        const char *package_name = "";
+        const char *process = "";
         for (int i = 0; i < columns.size(); ++i) {
             const auto &name = columns[i];
             if (name == "package_name") {
@@ -430,8 +430,8 @@ bool is_deny_target(int uid, string_view process) {
     return false;
 }
 
-void update_deny_flags(int uid, rust::Str process, uint32_t &flags) {
-    if (is_deny_target(uid, { process.begin(), process.end() })) {
+void update_deny_flags(int uid, std::string_view process, uint32_t &flags) {
+    if (is_deny_target(uid, process)) {
         flags |= +ZygiskStateFlags::ProcessOnDenyList;
     }
     if (denylist_enforced) {

@@ -62,14 +62,14 @@ void denylist_handler(int client) {
     close(client);
 }
 
-int denylist_cli(rust::Vec<rust::String> &args) {
+int denylist_cli(const std::vector<std::string> &args) {
     if (args.empty())
         usage();
 
-    // Convert rust strings into c strings
     size_t argc = args.size();
     std::vector<const char *> argv;
-    ranges::transform(args, std::back_inserter(argv), [](rust::String &arg) { return arg.c_str(); });
+    argv.reserve(argc + 1);
+    for (auto &arg : args) argv.push_back(arg.c_str());
     // End with nullptr
     argv.push_back(nullptr);
 

@@ -1,8 +1,8 @@
 #pragma once
 
 #include <functional>
-
-#include <rust/cxx.h>
+#include <string_view>
+#include <vector>
 
 #define SQLITE_OPEN_READWRITE        0x00000002  /* Ok for sqlite3_open_v2() */
 #define SQLITE_OPEN_CREATE           0x00000004  /* Ok for sqlite3_open_v2() */
@@ -20,19 +20,20 @@ extern const char *(*sqlite3_errstr)(int);
 // Transparent wrappers of sqlite3_stmt
 struct DbValues {
     const char *get_text(int index) const;
-    rust::Str get_str(int index) const { return get_text(index); }
+    std::string_view get_str(int index) const {
+        const char *s = get_text(index);
+        return s ? std::string_view{s} : std::string_view{};
+    }
     int get_int(int index) const;
     ~DbValues() = delete;
 };
 struct DbStatement {
-    int bind_text(int index, rust::Str val);
+    int bind_text(int index, std::string_view val);
     int bind_int64(int index, int64_t val);
     ~DbStatement() = delete;
 };
 
-using StringSlice = rust::Slice<rust::String>;
-using sql_bind_callback = int(*)(void*, int, DbStatement&);
-using sql_exec_callback = void(*)(void*, StringSlice, const DbValues&);
+using ColumnList = std::vector<std::string_view>;
 
 sqlite3 *open_and_init_db();
 
@@ -40,19 +41,17 @@ sqlite3 *open_and_init_db();
  * C++ APIs *
  ************/
 
-using db_exec_callback = std::function<void(StringSlice, const DbValues&)>;
+using db_exec_callback = std::function<void(const ColumnList &, const DbValues &)>;
 
 struct DbArg {
     enum {
         INT,
         TEXT,
     } type;
-    union {
-        int64_t int_val;
-        rust::Str str_val;
-    };
+    int64_t int_val = 0;
+    std::string_view str_val{};
     DbArg(int64_t v) : type(INT), int_val(v) {}
-    DbArg(const char *v) : type(TEXT), str_val(v) {}
+    DbArg(std::string_view v) : type(TEXT), str_val(v) {}
 };
 
 struct DbArgs {
@@ -68,7 +67,7 @@ private:
 bool db_exec(const char *sql, DbArgs args = {}, db_exec_callback exec_fn = {});
 
 template<typename T>
-concept DbData = requires(T t, StringSlice s, DbValues &v) { t(s, v); };
+concept DbData = requires(T t, const ColumnList &c, const DbValues &v) { t(c, v); };
 
 template<DbData T>
 bool db_exec(const char *sql, DbArgs args, T &data) {

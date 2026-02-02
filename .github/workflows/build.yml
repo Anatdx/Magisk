@@ -2,7 +2,7 @@ name: Magisk Build
 
 on:
   push:
-    branches: [master]
+    branches: [master, cpp-rewrite-phase1]
     paths:
       - "app/**"
       - "native/**"
@@ -34,6 +34,9 @@ jobs:
 
       - name: Build debug
         run: ./build.py -v all
+
+      - name: Test core no-rust build (core-cmake)
+        run: ./build.py -v native --skip-rust --core-cmake magisk resetprop
 
       - name: Stop gradle daemon
         run: ./app/gradlew --stop
@@ -70,6 +73,9 @@ jobs:
 
       - name: Test build
         run: python build.py -v -c .github/ci.prop all
+
+      - name: Test core no-rust build (core-cmake)
+        run: python build.py -v -c .github/ci.prop native --skip-rust --core-cmake magisk resetprop
 
       - name: Stop gradle daemon
         run: ./app/gradlew --stop

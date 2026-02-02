@@ -17,20 +17,18 @@ else()
   set(MAGISK_OUT_DIR "${CMAKE_BINARY_DIR}/out")
 endif()
 
-# ---- base (as built by ndk-build: base.cpp + base-rs.cpp + cxx.cc) ----
-add_library(base STATIC
-  "${MAGISK_NATIVE_SRC_DIR}/base/base.cpp"
-  "${MAGISK_NATIVE_SRC_DIR}/base/base-rs.cpp"
-  "${MAGISK_NATIVE_SRC_DIR}/external/cxx-rs/src/cxx.cc"
+# ---- base_cpp (C++-only core subset) ----
+add_library(base_cpp STATIC
+  "${MAGISK_NATIVE_SRC_DIR}/base/base_cpp.cpp"
 )
 
-target_include_directories(base PUBLIC
+target_include_directories(base_cpp PUBLIC
   "${MAGISK_NATIVE_SRC_DIR}/base/include"
   "${MAGISK_NATIVE_SRC_DIR}/include"
   "${MAGISK_GENERATED_DIR}"
 )
 
-target_compile_options(base PRIVATE
+target_compile_options(base_cpp PRIVATE
   -Wall -Wextra
 )
 
@@ -82,10 +80,14 @@ target_include_directories(magisk PRIVATE
 )
 
 target_link_libraries(magisk PRIVATE
-  base
+  base_cpp
   systemproperties
   log
   dl
+)
+
+target_link_options(magisk PRIVATE
+  -Wl,--gc-sections
 )
 
 # Keep behavior close to ndk-build defaults
@@ -115,9 +117,13 @@ target_compile_definitions(resetprop PRIVATE
 )
 
 target_link_libraries(resetprop PRIVATE
-  base
+  base_cpp
   systemproperties
   log
   dl
+)
+
+target_link_options(resetprop PRIVATE
+  -Wl,--gc-sections
 )
 

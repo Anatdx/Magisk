@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-#include <base.hpp>
+#include <base_cpp.hpp>
 
 // C++-only compatibility layer for core.
 // This replaces the historical Rust-generated `cxx::bridge` artifacts.
@@ -62,7 +62,7 @@ enum class SuPolicy : std::int32_t {
 };
 
 struct ModuleInfo {
-    rust::String name;
+    std::string name;
     std::int32_t z32 = 0;
     std::int32_t z64 = 0;
 };
@@ -86,10 +86,10 @@ struct SuRequest {
     bool login = false;
     bool keep_env = false;
     bool drop_cap = false;
-    rust::String shell;
-    rust::String command;
-    rust::String context;
-    rust::Vec<std::uint32_t> gids;
+    std::string shell;
+    std::string command;
+    std::string context;
+    std::vector<std::uint32_t> gids;
 
     void write_to_fd(std::int32_t fd) const noexcept;
     static SuRequest New() noexcept;
@@ -119,18 +119,18 @@ bool zygisk_should_load_module(std::uint32_t flags) noexcept;
 // FD passing helpers (SCM_RIGHTS), used by su/zygisk.
 bool send_fd(std::int32_t socket, std::int32_t fd) noexcept;
 std::int32_t recv_fd(std::int32_t socket) noexcept;
-rust::Vec<std::int32_t> recv_fds(std::int32_t socket) noexcept;
+std::vector<std::int32_t> recv_fds(std::int32_t socket) noexcept;
 
 // PTY helpers (used by su)
 void pump_tty(std::int32_t ptmx, bool pump_stdin) noexcept;
 std::int32_t get_pty_num(std::int32_t fd) noexcept;
 
 // SELinux helpers
-bool lgetfilecon(Utf8CStr path, MutByteSlice con) noexcept;
+bool lgetfilecon(Utf8CStr path, byte_data con) noexcept;
 bool setfilecon(Utf8CStr path, Utf8CStr con) noexcept;
 
 // Property & resetprop
-rust::String get_prop(Utf8CStr name) noexcept;
+std::string get_prop(Utf8CStr name) noexcept;
 std::int32_t resetprop_main(std::int32_t argc, char **argv) noexcept;
 
 // Core entry points

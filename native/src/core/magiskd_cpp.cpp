@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-#include <base.hpp>
+#include <base_cpp.hpp>
 #include <consts.hpp>
 #include <sqlite.hpp>
 
@@ -278,7 +278,7 @@ static std::string get_peer_context(int fd) {
 static bool set_db_setting_i32(const char *key, int32_t value) {
     return db_exec(
         "INSERT OR REPLACE INTO settings (key,value) VALUES(?,?)",
-        DbArgs{key, static_cast<int64_t>(value)}
+        DbArgs{DbArg{key}, DbArg{static_cast<int64_t>(value)}}
     );
 }
 
@@ -425,12 +425,12 @@ static void handle_boot_stage(RequestCode code) {
 
 static bool denylist_row_exists(const std::string &pkg, const std::string &proc) {
     bool exists = false;
-    auto cb = [&](StringSlice, const DbValues &) {
+    auto cb = [&](const ColumnList &, const DbValues &) {
         exists = true;
     };
     (void)db_exec(
         "SELECT 1 FROM denylist WHERE package_name=? AND process=? LIMIT 1",
-        DbArgs{pkg.c_str(), proc.c_str()},
+        DbArgs{DbArg{pkg}, DbArg{proc}},
         cb
     );
     return exists;
@@ -488,7 +488,7 @@ static void handle_denylist_cmd(int fd) {
             }
             bool ok = db_exec(
                 "INSERT OR IGNORE INTO denylist (package_name, process) VALUES (?,?)",
-                DbArgs{pkg.c_str(), proc.c_str()}
+                DbArgs{DbArg{pkg}, DbArg{proc}}
             );
             write_pod_i32(fd, ok ? DenyResponse::OK : DenyResponse::ERROR);
             break;
@@ -502,17 +502,17 @@ static void handle_denylist_cmd(int fd) {
             }
             if (proc.empty()) {
                 bool any = false;
-                auto cb = [&](StringSlice, const DbValues &) { any = true; };
+                auto cb = [&](const ColumnList &, const DbValues &) { any = true; };
                 (void)db_exec(
                     "SELECT 1 FROM denylist WHERE package_name=? LIMIT 1",
-                    DbArgs{pkg.c_str()},
+                    DbArgs{DbArg{pkg}},
                     cb
                 );
                 if (!any) {
                     write_pod_i32(fd, DenyResponse::ITEM_NOT_EXIST);
                     break;
                 }
-                bool ok = db_exec("DELETE FROM denylist WHERE package_name=?", DbArgs{pkg.c_str()});
+                bool ok = db_exec("DELETE FROM denylist WHERE package_name=?", DbArgs{DbArg{pkg}});
                 write_pod_i32(fd, ok ? DenyResponse::OK : DenyResponse::ERROR);
             } else {
                 if (!denylist_row_exists(pkg, proc)) {
@@ -521,7 +521,7 @@ static void handle_denylist_cmd(int fd) {
                 }
                 bool ok = db_exec(
                     "DELETE FROM denylist WHERE package_name=? AND process=?",
-                    DbArgs{pkg.c_str(), proc.c_str()}
+                    DbArgs{DbArg{pkg}, DbArg{proc}}
                 );
                 write_pod_i32(fd, ok ? DenyResponse::OK : DenyResponse::ERROR);
             }
@@ -530,7 +530,7 @@ static void handle_denylist_cmd(int fd) {
         case DenyRequest::LIST: {
             // Follow deny/utils.cpp framing: first a response int, then repeated (len+iobuf), ending with len=0.
             write_pod_i32(fd, DenyResponse::OK);
-            auto cb = [&](StringSlice columns, const DbValues &values) {
+            auto cb = [&](const ColumnList &columns, const DbValues &values) {
                 const char *pkg = "";
                 const char *proc = "";
                 for (int i = 0; i < columns.size(); ++i) {
@@ -558,11 +558,11 @@ static void handle_sqlite_cmd(int fd) {
         return;
     }
 
-    auto cb = [&](StringSlice columns, const DbValues &values) {
+    auto cb = [&](const ColumnList &columns, const DbValues &values) {
         std::string out;
         for (int i = 0; i < columns.size(); ++i) {
             if (i != 0) out.push_back('|');
-            out += columns[i].c_str();
+            out += std::string(columns[i]);
             out.push_back('=');
             out += values.get_text(i);
         }
@@ -679,18 +679,18 @@ static bool read_su_request(int fd, SuRequestCpp &req) {
 static int32_t db_get_setting_i32(const char *key, int32_t def) {
     int32_t out = def;
     bool got = false;
-    auto cb = [&](StringSlice, const DbValues &v) {
+    auto cb = [&](const ColumnList &, const DbValues &v) {
         out = v.get_int(0);
         got = true;
     };
-    (void)db_exec("SELECT value FROM settings WHERE key=?", DbArgs{key}, cb);
+    (void)db_exec("SELECT value FROM settings WHERE key=?", DbArgs{DbArg{key}}, cb);
     (void)got;
     return out;
 }
 
 static RootSettingsCpp db_get_root_settings_for_uid(int32_t uid) {
     RootSettingsCpp out{};
-    auto cb = [&](StringSlice columns, const DbValues &v) {
+    auto cb = [&](const ColumnList &columns, const DbValues &v) {
         for (int i = 0; i < columns.size(); ++i) {
             const auto &col = columns[i];
             const int val = v.get_int(i);
@@ -702,7 +702,7 @@ static RootSettingsCpp db_get_root_settings_for_uid(int32_t uid) {
     (void)db_exec(
         "SELECT policy, logging, notification FROM policies "
         "WHERE uid=? AND (until=0 OR until>strftime('%s', 'now'))",
-        DbArgs{static_cast<int64_t>(uid)},
+        DbArgs{DbArg{static_cast<int64_t>(uid)}},
         cb
     );
     return out;
@@ -710,11 +710,11 @@ static RootSettingsCpp db_get_root_settings_for_uid(int32_t uid) {
 
 static std::string db_get_string_value(const char *key) {
     std::string out;
-    auto cb = [&](StringSlice, const DbValues &v) {
+    auto cb = [&](const ColumnList &, const DbValues &v) {
         const char *s = v.get_text(0);
         if (s) out.assign(s);
     };
-    (void)db_exec("SELECT value FROM strings WHERE key=?", DbArgs{key}, cb);
+    (void)db_exec("SELECT value FROM strings WHERE key=?", DbArgs{DbArg{key}}, cb);
     return out;
 }
 
@@ -777,7 +777,7 @@ static void prune_su_policies() {
     constexpr int32_t AID_APP_END = 19999;
 
     std::vector<int32_t> uids;
-    auto cb = [&](StringSlice, const DbValues &v) {
+    auto cb = [&](const ColumnList &, const DbValues &v) {
         uids.push_back(v.get_int(0));
     };
     (void)db_exec("SELECT uid FROM policies", {}, cb);
@@ -790,7 +790,7 @@ static void prune_su_policies() {
         int32_t app_no = app_id - AID_APP_START;
         if (app_no < 0 || app_no >= static_cast<int32_t>(present.size())) continue;
         if (!present[static_cast<size_t>(app_no)]) {
-            (void)db_exec("DELETE FROM policies WHERE uid=?", DbArgs{static_cast<int64_t>(uid)});
+            (void)db_exec("DELETE FROM policies WHERE uid=?", DbArgs{DbArg{static_cast<int64_t>(uid)}});
         }
     }
 }

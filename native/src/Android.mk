@@ -9,8 +9,7 @@ ifdef B_MAGISK
 include $(CLEAR_VARS)
 LOCAL_MODULE := magisk
 LOCAL_STATIC_LIBRARIES := \
-    libbase \
-    libbase-rs \
+    libbase_cpp \
     libsystemproperties \
     liblsplt
 
@@ -40,7 +39,7 @@ ifdef MAGISK_CPP_DAEMON
 include $(CLEAR_VARS)
 LOCAL_MODULE := magiskd-cpp
 LOCAL_STATIC_LIBRARIES := \
-    libbase
+    libbase_cpp
 
 LOCAL_SRC_FILES := \
     core/magiskd_cpp.cpp \
@@ -138,8 +137,7 @@ ifdef B_PROP
 include $(CLEAR_VARS)
 LOCAL_MODULE := resetprop
 LOCAL_STATIC_LIBRARIES := \
-    libbase \
-    libbase-rs \
+    libbase_cpp \
     libsystemproperties
 
 LOCAL_SRC_FILES := \

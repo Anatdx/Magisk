@@ -75,7 +75,6 @@ void SuRequest::write_to_fd(int32_t fd) const noexcept {
     write_any<uint8_t>(fd, login ? 1 : 0);
     write_any<uint8_t>(fd, keep_env ? 1 : 0);
     write_any<uint8_t>(fd, drop_cap ? 1 : 0);
-    // `rust::String::c_str()` is non-const; use data/size instead.
     write_string(fd, std::string_view(shell.data(), shell.size()));
     write_string(fd, std::string_view(command.data(), command.size()));
     write_string(fd, std::string_view(context.data(), context.size()));
@@ -124,11 +123,11 @@ int32_t MagiskD::get_db_setting(DbEntryKey key) const noexcept {
     int32_t out = 0;
     bool got = false;
     const char *k = db_key_name(key);
-    auto cb = [&](StringSlice, const DbValues &v) {
+    auto cb = [&](const ColumnList &, const DbValues &v) {
         out = v.get_int(0);
         got = true;
     };
-    (void)db_exec("SELECT value FROM settings WHERE key=?", DbArgs{k}, cb);
+    (void)db_exec("SELECT value FROM settings WHERE key=?", DbArgs{DbArg{k}}, cb);
     (void)got;
     return out;
 }
@@ -137,7 +136,7 @@ bool MagiskD::set_db_setting(DbEntryKey key, int32_t value) const noexcept {
     const char *k = db_key_name(key);
     return db_exec(
         "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
-        DbArgs{k, static_cast<int64_t>(value)}
+        DbArgs{DbArg{k}, DbArg{static_cast<int64_t>(value)}}
     );
 }
 
@@ -228,7 +227,7 @@ int32_t recv_fd(int32_t socket) noexcept {
     return -1;
 }
 
-rust::Vec<int32_t> recv_fds(int32_t socket) noexcept {
+std::vector<int32_t> recv_fds(int32_t socket) noexcept {
     int32_t count = 0;
     char cmsgbuf[CMSG_SPACE(sizeof(int) * 64)];
     memset(cmsgbuf, 0, sizeof(cmsgbuf));
@@ -242,12 +241,10 @@ rust::Vec<int32_t> recv_fds(int32_t socket) noexcept {
     msg.msg_control = cmsgbuf;
     msg.msg_controllen = sizeof(cmsgbuf);
 
-    if (recvmsg(socket, &msg, 0) < 0) {
-        return {};
-    }
+    if (recvmsg(socket, &msg, 0) < 0) return {};
 
-    rust::Vec<int32_t> out;
-    out.reserve(count > 0 ? (size_t)count : 0);
+    std::vector<int32_t> out;
+    out.reserve(count > 0 ? static_cast<size_t>(count) : 0);
 
     for (cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
         if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
@@ -306,7 +303,7 @@ void pump_tty(int32_t ptmx, bool pump_stdin) noexcept {
 // -------------------------------------------------------------------------
 // SELinux context via xattr (avoids linking libselinux)
 
-bool lgetfilecon(Utf8CStr path, MutByteSlice con) noexcept {
+bool lgetfilecon(Utf8CStr path, byte_data con) noexcept {
     if (con.size() == 0) return false;
     ssize_t n = lgetxattr(path.c_str(), "security.selinux", con.data(), con.size() - 1);
     if (n <= 0) {
@@ -324,12 +321,12 @@ bool setfilecon(Utf8CStr path, Utf8CStr con) noexcept {
 // -------------------------------------------------------------------------
 // Properties
 
-rust::String get_prop(Utf8CStr name) noexcept {
+std::string get_prop(Utf8CStr name) noexcept {
     char buf[PROP_VALUE_MAX]{};
     if (__system_property_get(name.c_str(), buf) <= 0) {
-        return rust::String();
+        return {};
     }
-    return rust::String(buf);
+    return std::string(buf);
 }
 
 // resetprop is still Rust in upstream; for the "core no-rust" milestone,
@@ -542,9 +539,9 @@ int32_t magisk_main(int32_t argc, char **argv) noexcept {
 
     if (a1 == "--denylist") {
         if (argc < 3) return 1;
-        rust::Vec<rust::String> args;
+        std::vector<std::string> args;
         for (int i = 2; i < argc; ++i) {
-            args.push_back(rust::String(argv[i]));
+            args.emplace_back(argv[i] ? argv[i] : "");
         }
         return denylist_cli(args);
     }

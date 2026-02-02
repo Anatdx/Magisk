@@ -20,7 +20,7 @@
 #include <algorithm>
 
 #include <consts.hpp>
-#include <base.hpp>
+#include <base_cpp.hpp>
 #include <flags.h>
 #include <core.hpp>
 
@@ -307,13 +307,16 @@ static bool proc_is_restricted(pid_t pid) {
     return equal;
 }
 
-static void set_identity(int uid, const rust::Vec<gid_t> &groups) {
+static void set_identity(int uid, const std::vector<uint32_t> &groups) {
     gid_t gid;
     if (!groups.empty()) {
-        if (setgroups(groups.size(), groups.data())) {
+        std::vector<gid_t> gids;
+        gids.reserve(groups.size());
+        for (auto g : groups) gids.push_back(static_cast<gid_t>(g));
+        if (setgroups(gids.size(), gids.data())) {
             PLOGE("setgroups");
         }
-        gid = groups[0];
+        gid = gids[0];
     } else {
         gid = uid;
     }
