@@ -304,19 +304,6 @@ void pump_tty(int32_t ptmx, bool pump_stdin) noexcept {
 }
 
 // -------------------------------------------------------------------------
-// Mount namespace
-
-int switch_mnt_ns(int pid) {
-    char path[64];
-    ssprintf(path, sizeof(path), "/proc/%d/ns/mnt", pid);
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return -1;
-    int r = setns(fd, 0);
-    close(fd);
-    return r;
-}
-
-// -------------------------------------------------------------------------
 // SELinux context via xattr (avoids linking libselinux)
 
 bool lgetfilecon(Utf8CStr path, MutByteSlice con) noexcept {

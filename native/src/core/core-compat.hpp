@@ -125,9 +125,6 @@ rust::Vec<std::int32_t> recv_fds(std::int32_t socket) noexcept;
 void pump_tty(std::int32_t ptmx, bool pump_stdin) noexcept;
 std::int32_t get_pty_num(std::int32_t fd) noexcept;
 
-// Mount namespace helper
-int switch_mnt_ns(int pid);
-
 // SELinux helpers
 bool lgetfilecon(Utf8CStr path, MutByteSlice con) noexcept;
 bool setfilecon(Utf8CStr path, Utf8CStr con) noexcept;
