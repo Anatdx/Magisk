@@ -23,9 +23,7 @@ LOCAL_SRC_FILES := \
     core/core-compat.cpp \
     core/resetprop/sys.cpp \
     core/su/su.cpp \
-    core/zygisk/entry.cpp \
-    core/zygisk/module.cpp \
-    core/zygisk/hook.cpp \
+    core/zygisk_stub.cpp \
     core/deny/cli.cpp \
     core/deny/utils.cpp \
     core/deny/logcat.cpp
