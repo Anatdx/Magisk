@@ -1,5 +1,7 @@
 #include <sys/mount.h>
+#include <sys/xattr.h>
 #include <libgen.h>
+#include <cstring>
 
 #include <sepolicy.hpp>
 #include <consts.hpp>
@@ -242,6 +244,10 @@ static void extract_files(bool sbin) {
         int fd = xopen("magisk", O_WRONLY | O_CREAT, 0755);
         unxz(fd, magisk);
         close(fd);
+        // `magisk` lives on tmpfs during early boot; make sure it's labeled as
+        // Magisk file type so untrusted apps can execute the `su` applet.
+        // Otherwise, tests fail with: avc: denied { execute } ... tcontext=u:object_r:tmpfs:s0
+        (void)lsetxattr("magisk", "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON), 0);
     }
     if (access(stub_xz, F_OK) == 0) {
         mmap_data stub(stub_xz);
@@ -372,6 +378,7 @@ void MagiskInit::patch_rw_root() noexcept {
 
     // Dump magiskinit as magisk
     cp_afc(REDIR_PATH, "/sbin/magisk");
+    (void)lsetxattr("/sbin/magisk", "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON), 0);
 }
 
 int magisk_proxy_main(int, char *argv[]) {
