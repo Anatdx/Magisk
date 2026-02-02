@@ -10,6 +10,7 @@ include $(CLEAR_VARS)
 LOCAL_MODULE := magisk
 LOCAL_STATIC_LIBRARIES := \
     libbase \
+    libbase-rs \
     libsystemproperties \
     liblsplt
 
@@ -140,6 +141,7 @@ include $(CLEAR_VARS)
 LOCAL_MODULE := resetprop
 LOCAL_STATIC_LIBRARIES := \
     libbase \
+    libbase-rs \
     libsystemproperties
 
 LOCAL_SRC_FILES := \

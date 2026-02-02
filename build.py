@@ -79,7 +79,7 @@ default_abis = support_abis.keys() - {"riscv64"}
 support_targets = {"magisk", "magiskinit", "magiskboot", "magiskpolicy", "resetprop"}
 default_targets = support_targets - {"resetprop"}
 # Core has been migrated to C++ (no core Rust crate).
-rust_targets = default_targets.copy() - {"magisk"}
+rust_targets = (default_targets.copy() - {"magisk"}) | {"base"}
 clean_targets = {"native", "cpp", "rust", "app"}
 ondk_version = "r29.4"
 
@@ -316,6 +316,10 @@ def run_cargo(cmds: list[str]):
 
 def build_rust_src(targets: set[str]):
     targets = targets.copy()
+    # Core binaries no longer link the Rust `magisk` crate, but still require
+    # the Rust `base` crate for xwraps and cxx runtime symbols.
+    if "magisk" in targets or "resetprop" in targets:
+        targets.add("base")
     targets = targets & rust_targets
     if not targets:
         return
