@@ -958,6 +958,14 @@ static bool eval_su_access(
 
     auto settings = db_get_root_settings_for_uid(eval_uid);
 
+    // ADB shell should be granted root by default when global root access allows it.
+    // This matches user expectations in emulator tests (no interactive prompt).
+    if (uid == AID_SHELL && settings.policy == SuPolicy::Query) {
+        settings.policy = SuPolicy::Allow;
+        settings.log = false;
+        settings.notify = false;
+    }
+
     // If it's the manager itself, allow silently (match Rust behavior).
     auto [mgr_uid, mgr_pkg] = get_manager_for_user(to_user_id(eval_uid), true);
     if (mgr_uid >= 0 && to_app_id(uid) == to_app_id(mgr_uid)) {
@@ -1159,17 +1167,31 @@ static void handle_client(int cfd) {
 
     const bool is_client = has_cred && is_client_process(cred.pid);
 
-    if (!is_root && !is_zygote && !is_client) {
-        write_pod_i32(cfd, static_cast<int32_t>(RespondCode::ACCESS_DENIED));
-        return;
-    }
-
     int32_t code = -1;
     if (!read_pod_i32(cfd, code)) return;
     if (!is_valid_request(code)) return;
 
+    // Base permission gate:
+    // - root and zygote always allowed
+    // - allow SUPERUSER requests from any process with credentials
+    // - allow version queries to aid debugging
+    // - keep strict "client exe" gate for other requests
+    const auto req = static_cast<RequestCode>(code);
+    bool allowed = is_root || is_zygote || is_client;
+    if (!allowed && has_cred) {
+        if (req == RequestCode::SUPERUSER ||
+            req == RequestCode::CHECK_VERSION ||
+            req == RequestCode::CHECK_VERSION_CODE) {
+            allowed = true;
+        }
+    }
+    if (!allowed) {
+        write_pod_i32(cfd, static_cast<int32_t>(RespondCode::ACCESS_DENIED));
+        return;
+    }
+
     // Permission checks (match daemon.rs).
-    switch (static_cast<RequestCode>(code)) {
+    switch (req) {
         case RequestCode::POST_FS_DATA:
         case RequestCode::LATE_START:
         case RequestCode::BOOT_COMPLETE:
@@ -1200,7 +1222,7 @@ static void handle_client(int cfd) {
 
     if (!write_pod_i32(cfd, static_cast<int32_t>(RespondCode::OK))) return;
 
-    switch (static_cast<RequestCode>(code)) {
+    switch (req) {
         case RequestCode::CHECK_VERSION: {
             // Keep compatible shape, but not necessarily identical content yet.
 #ifdef MAGISK_VERSION

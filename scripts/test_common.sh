@@ -14,7 +14,15 @@ avd="$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager"
 
 boot_timeout=100
 
-core_count=$(nproc)
+if command -v nproc >/dev/null 2>&1; then
+  core_count=$(nproc)
+elif command -v getconf >/dev/null 2>&1; then
+  core_count=$(getconf _NPROCESSORS_ONLN)
+elif command -v sysctl >/dev/null 2>&1; then
+  core_count=$(sysctl -n hw.ncpu)
+else
+  core_count=4
+fi
 if [ $core_count -gt 8 ]; then
   core_count=8
 fi

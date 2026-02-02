@@ -513,6 +513,180 @@ int32_t connect_daemon(RequestCode code, bool create) noexcept {
 // -------------------------------------------------------------------------
 // magisk_main minimal C++ CLI dispatcher
 
+// Minimal port of Rust `mount::find_preinit_device()` used by AVD tests.
+// It returns a block device basename (e.g. "sda14") or empty string.
+enum class EncryptTypeCpp {
+    None,
+    Block,
+    File,
+    Metadata,
+};
+
+enum class PartIdCpp {
+    Data = 0,
+    Cache = 1,
+    Metadata = 2,
+    Persist = 3,
+};
+
+struct MountInfoFull {
+    std::string root;
+    std::string target;
+    std::string vfs_opt;
+    std::string fs_type;
+    std::string source;
+};
+
+static std::vector<MountInfoFull> parse_mount_info_full(std::string_view pid) {
+    std::vector<MountInfoFull> out;
+    std::string path = "/proc/";
+    path.append(pid.data(), pid.size());
+    path += "/mountinfo";
+
+    std::string content = full_read(path.c_str());
+    if (content.empty()) return out;
+
+    auto next_tok = [](const std::string &s, size_t &pos, std::string_view &tok) -> bool {
+        while (pos < s.size() && std::isspace(static_cast<unsigned char>(s[pos]))) ++pos;
+        if (pos >= s.size()) return false;
+        size_t start = pos;
+        while (pos < s.size() && !std::isspace(static_cast<unsigned char>(s[pos]))) ++pos;
+        tok = std::string_view(s.data() + start, pos - start);
+        return true;
+    };
+
+    size_t off = 0;
+    while (off < content.size()) {
+        size_t eol = content.find('\n', off);
+        if (eol == std::string::npos) eol = content.size();
+        std::string line = content.substr(off, eol - off);
+        off = (eol == content.size()) ? eol : eol + 1;
+        if (line.empty()) continue;
+
+        size_t pos = 0;
+        std::string_view id, parent, dev, root, target, vfs_opt;
+        if (!next_tok(line, pos, id) ||
+            !next_tok(line, pos, parent) ||
+            !next_tok(line, pos, dev) ||
+            !next_tok(line, pos, root) ||
+            !next_tok(line, pos, target) ||
+            !next_tok(line, pos, vfs_opt)) {
+            continue;
+        }
+        std::string_view tok;
+        while (next_tok(line, pos, tok)) {
+            if (tok == "-") break;
+        }
+        std::string_view fs_type, source, fs_opt;
+        if (!next_tok(line, pos, fs_type) || !next_tok(line, pos, source) || !next_tok(line, pos, fs_opt)) {
+            continue;
+        }
+        out.push_back(MountInfoFull{
+            .root = std::string(root),
+            .target = std::string(target),
+            .vfs_opt = std::string(vfs_opt),
+            .fs_type = std::string(fs_type),
+            .source = std::string(source),
+        });
+    }
+    return out;
+}
+
+static std::string find_preinit_device_cpp() {
+    EncryptTypeCpp enc = EncryptTypeCpp::None;
+    if (get_prop(Utf8CStr("ro.crypto.state")) == "encrypted") {
+        if (get_prop(Utf8CStr("ro.crypto.type")) == "block") {
+            enc = EncryptTypeCpp::Block;
+        } else if (get_prop(Utf8CStr("ro.crypto.metadata.enabled")) == "true") {
+            enc = EncryptTypeCpp::Metadata;
+        } else {
+            enc = EncryptTypeCpp::File;
+        }
+    }
+
+    struct Cand {
+        PartIdCpp part;
+        bool is_ext4;
+        std::string source;
+    };
+    std::vector<Cand> cands;
+
+    for (auto &info : parse_mount_info_full("self")) {
+        if (info.root != "/") continue;
+        if (info.source.empty() || info.source[0] != '/') continue;
+        if (info.source.find("/dm-") != std::string::npos) continue;
+
+        bool is_ext4 = (info.fs_type == "ext4");
+        bool is_f2fs = (info.fs_type == "f2fs");
+        if (!is_ext4 && !is_f2fs) continue;
+
+        // Must be RW
+        bool has_rw = false;
+        size_t p = 0;
+        while (p < info.vfs_opt.size()) {
+            size_t q = info.vfs_opt.find(',', p);
+            if (q == std::string::npos) q = info.vfs_opt.size();
+            if (info.vfs_opt.compare(p, q - p, "rw") == 0) {
+                has_rw = true;
+                break;
+            }
+            p = q + 1;
+        }
+        if (!has_rw) continue;
+
+        // Require parent path ends with "by-name" or "block"
+        size_t last_slash = info.source.find_last_of('/');
+        if (last_slash == std::string::npos || last_slash == 0) continue;
+        std::string_view parent(info.source.data(), last_slash);
+        auto ends_with = [](std::string_view s, std::string_view suf) {
+            return s.size() >= suf.size() && s.substr(s.size() - suf.size()) == suf;
+        };
+        if (!ends_with(parent, "by-name") && !ends_with(parent, "block")) continue;
+
+        PartIdCpp part;
+        if (info.target == "/persist" || info.target == "/mnt/vendor/persist") {
+            part = PartIdCpp::Persist;
+        } else if (info.target == "/metadata") {
+            part = PartIdCpp::Metadata;
+        } else if (info.target == "/cache") {
+            part = PartIdCpp::Cache;
+        } else if (info.target == "/data") {
+            // Take data iff it's not encrypted or file-based encrypted without metadata
+            if (!(enc == EncryptTypeCpp::None || enc == EncryptTypeCpp::File)) continue;
+            part = PartIdCpp::Data;
+        } else {
+            continue;
+        }
+
+        cands.push_back(Cand{part, is_ext4, info.source});
+    }
+
+    if (cands.empty()) return {};
+
+    auto better = [](const Cand &a, const Cand &b) -> bool {
+        // Port Rust comparator:
+        // - metadata is not affected by f2fs kernel bug, so if one is metadata and the other is ext4,
+        //   compare by partition ordering.
+        if ((a.part == PartIdCpp::Metadata && b.is_ext4) || (b.part == PartIdCpp::Metadata && a.is_ext4)) {
+            return static_cast<int>(a.part) < static_cast<int>(b.part);
+        }
+        // otherwise prefer ext4 over f2fs
+        if (a.is_ext4 && !b.is_ext4) return true;
+        if (!a.is_ext4 && b.is_ext4) return false;
+        // if both have same fs type, compare partition ordering
+        return static_cast<int>(a.part) < static_cast<int>(b.part);
+    };
+
+    Cand best = cands[0];
+    for (size_t i = 1; i < cands.size(); ++i) {
+        if (better(cands[i], best)) best = cands[i];
+    }
+
+    size_t slash = best.source.find_last_of('/');
+    if (slash == std::string::npos || slash + 1 >= best.source.size()) return {};
+    return best.source.substr(slash + 1);
+}
+
 static void print_usage() {
     fprintf(stderr,
         "Magisk - Multi-purpose Utility\n\n"
@@ -531,6 +705,7 @@ static void print_usage() {
         "  --sqlite SQL         exec SQL commands to Magisk database\n"
         "  --path              print Magisk tmpfs mount path\n"
         "  --denylist ARGS...   denylist config CLI\n"
+        "  --preinit-device     resolve a device to store preinit files\n"
     );
 }
 
@@ -651,6 +826,13 @@ int32_t magisk_main(int32_t argc, char **argv) noexcept {
             args.emplace_back(argv[i] ? argv[i] : "");
         }
         return denylist_cli(args);
+    }
+
+    if (a1 == "--preinit-device") {
+        std::string name = find_preinit_device_cpp();
+        if (name.empty()) return 1;
+        printf("%s\n", name.c_str());
+        return 0;
     }
 
     print_usage();
