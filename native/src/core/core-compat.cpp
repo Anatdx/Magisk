@@ -482,7 +482,10 @@ int32_t connect_daemon(RequestCode code, bool create) noexcept {
     int fd = try_connect();
     if (fd >= 0) return fd;
 
-    if (!create || getuid() != 0) {
+    // Note: MagiskSU is typically setuid-root.
+    // The real UID may be a non-root app, but effective UID is 0.
+    // Use geteuid() so suid-root callers can spawn magiskd when allowed.
+    if (!create || geteuid() != 0) {
         return -1;
     }
 

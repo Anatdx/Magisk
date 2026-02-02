@@ -20,7 +20,9 @@
 #define APP_DATA_DIR (SDK_INT >= 24 ? "/data/user_de" : "/data/user")
 
 inline int connect_daemon(RequestCode req) {
-    return connect_daemon(req, false);
+    // Default behavior should match upstream: if the socket isn't up yet,
+    // attempt to spawn `magiskd` (works because MagiskSU is suid-root).
+    return connect_daemon(req, true);
 }
 
 // Multi-call entrypoints

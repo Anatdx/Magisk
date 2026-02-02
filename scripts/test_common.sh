@@ -9,8 +9,32 @@ export ANDROID_AVD_HOME="$ANDROID_EMULATOR_HOME/avd"
 export PATH="$PATH:$ANDROID_HOME/platform-tools"
 
 emu="$ANDROID_HOME/emulator/emulator"
-sdk="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-avd="$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager"
+# cmdline-tools path varies across installations.
+# Prefer modern cmdline-tools, then fall back to legacy tools if present.
+sdk=""
+avd=""
+for p in \
+  "$ANDROID_HOME/cmdline-tools/latest/bin" \
+  "$ANDROID_HOME/cmdline-tools/bin" \
+  "$ANDROID_HOME/tools/bin"
+do
+  if [ -z "$sdk" ] && [ -x "$p/sdkmanager" ]; then
+    sdk="$p/sdkmanager"
+  fi
+  if [ -z "$avd" ] && [ -x "$p/avdmanager" ]; then
+    avd="$p/avdmanager"
+  fi
+done
+
+if [ -z "$sdk" ] || [ -z "$avd" ]; then
+  print_error "! Android cmdline-tools not found under ANDROID_HOME=$ANDROID_HOME"
+  print_error "  Please install Android SDK Command-line Tools (sdkmanager/avdmanager) and ensure they are under:"
+  print_error "    $ANDROID_HOME/cmdline-tools/latest/bin/  (preferred)"
+  print_error "  or:"
+  print_error "    $ANDROID_HOME/cmdline-tools/bin/"
+  print_error "    $ANDROID_HOME/tools/bin/"
+  exit 1
+fi
 
 boot_timeout=100
 
