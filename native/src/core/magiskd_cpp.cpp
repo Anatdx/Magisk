@@ -5,6 +5,7 @@
 #include <sys/mount.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #include <arpa/inet.h>
@@ -22,6 +23,13 @@
 #include <base_cpp.hpp>
 #include <consts.hpp>
 #include <sqlite.hpp>
+
+// Core denylist state & helpers live in deny/*.cpp
+extern std::atomic<bool> denylist_enforced;
+void denylist_handler(int client);
+void initialize_denylist();
+bool is_deny_target(int uid, std::string_view process);
+void scan_deny_apps();
 
 namespace {
 
@@ -131,8 +139,6 @@ static constexpr int32_t AID_USER_OFFSET = 100000;
 
 static inline int32_t to_app_id(int32_t uid) { return uid % AID_USER_OFFSET; }
 static inline int32_t to_user_id(int32_t uid) { return uid / AID_USER_OFFSET; }
-
-static std::atomic<bool> denylist_enforced{false};
 
 struct ExeAttr {
     dev_t dev{};
@@ -285,9 +291,8 @@ static bool set_db_setting_i32(const char *key, int32_t value) {
 static int32_t db_get_setting_i32(const char *key, int32_t def);
 
 static void init_denylist_state_from_db() {
-    // settings key matches DbEntryKey::DenylistConfig -> "denylist"
-    const int32_t v = db_get_setting_i32("denylist", 0);
-    denylist_enforced.store(v != 0, std::memory_order_relaxed);
+    // Use the core denylist implementation (reads DB and starts logcat watcher if needed).
+    initialize_denylist();
 }
 
 static bool check_data_mounted_ready() {
@@ -423,132 +428,9 @@ static void handle_boot_stage(RequestCode code) {
     }
 }
 
-static bool denylist_row_exists(const std::string &pkg, const std::string &proc) {
-    bool exists = false;
-    auto cb = [&](const ColumnList &, const DbValues &) {
-        exists = true;
-    };
-    (void)db_exec(
-        "SELECT 1 FROM denylist WHERE package_name=? AND process=? LIMIT 1",
-        DbArgs{DbArg{pkg}, DbArg{proc}},
-        cb
-    );
-    return exists;
-}
-
-static int32_t denylist_enable() {
-    if (denylist_enforced.load(std::memory_order_relaxed)) {
-        (void)set_db_setting_i32("denylist", 1);
-        return DenyResponse::OK;
-    }
-    if (access("/proc/self/ns/mnt", F_OK) != 0) {
-        return DenyResponse::NO_NS;
-    }
-    denylist_enforced.store(true, std::memory_order_relaxed);
-    (void)set_db_setting_i32("denylist", 1);
-    return DenyResponse::OK;
-}
-
-static int32_t denylist_disable() {
-    denylist_enforced.store(false, std::memory_order_relaxed);
-    (void)set_db_setting_i32("denylist", 0);
-    return DenyResponse::OK;
-}
-
 static void handle_denylist_cmd(int fd) {
-    int32_t req = -1;
-    if (!read_pod_i32(fd, req)) return;
-    int32_t res = DenyResponse::ERROR;
-
-    switch (req) {
-        case DenyRequest::ENFORCE:
-            res = denylist_enable();
-            write_pod_i32(fd, res);
-            break;
-        case DenyRequest::DISABLE:
-            res = denylist_disable();
-            write_pod_i32(fd, res);
-            break;
-        case DenyRequest::STATUS:
-            res = denylist_enforced.load(std::memory_order_relaxed) ? DenyResponse::ENFORCED
-                                                                    : DenyResponse::NOT_ENFORCED;
-            write_pod_i32(fd, res);
-            break;
-        case DenyRequest::ADD: {
-            std::string pkg = read_string(fd);
-            std::string proc = read_string(fd);
-            if (proc.empty()) proc = pkg;
-            if (pkg.empty() || proc.empty()) {
-                write_pod_i32(fd, DenyResponse::INVALID_PKG);
-                break;
-            }
-            if (denylist_row_exists(pkg, proc)) {
-                write_pod_i32(fd, DenyResponse::ITEM_EXIST);
-                break;
-            }
-            bool ok = db_exec(
-                "INSERT OR IGNORE INTO denylist (package_name, process) VALUES (?,?)",
-                DbArgs{DbArg{pkg}, DbArg{proc}}
-            );
-            write_pod_i32(fd, ok ? DenyResponse::OK : DenyResponse::ERROR);
-            break;
-        }
-        case DenyRequest::REMOVE: {
-            std::string pkg = read_string(fd);
-            std::string proc = read_string(fd);
-            if (pkg.empty()) {
-                write_pod_i32(fd, DenyResponse::INVALID_PKG);
-                break;
-            }
-            if (proc.empty()) {
-                bool any = false;
-                auto cb = [&](const ColumnList &, const DbValues &) { any = true; };
-                (void)db_exec(
-                    "SELECT 1 FROM denylist WHERE package_name=? LIMIT 1",
-                    DbArgs{DbArg{pkg}},
-                    cb
-                );
-                if (!any) {
-                    write_pod_i32(fd, DenyResponse::ITEM_NOT_EXIST);
-                    break;
-                }
-                bool ok = db_exec("DELETE FROM denylist WHERE package_name=?", DbArgs{DbArg{pkg}});
-                write_pod_i32(fd, ok ? DenyResponse::OK : DenyResponse::ERROR);
-            } else {
-                if (!denylist_row_exists(pkg, proc)) {
-                    write_pod_i32(fd, DenyResponse::ITEM_NOT_EXIST);
-                    break;
-                }
-                bool ok = db_exec(
-                    "DELETE FROM denylist WHERE package_name=? AND process=?",
-                    DbArgs{DbArg{pkg}, DbArg{proc}}
-                );
-                write_pod_i32(fd, ok ? DenyResponse::OK : DenyResponse::ERROR);
-            }
-            break;
-        }
-        case DenyRequest::LIST: {
-            // Follow deny/utils.cpp framing: first a response int, then repeated (len+iobuf), ending with len=0.
-            write_pod_i32(fd, DenyResponse::OK);
-            auto cb = [&](const ColumnList &columns, const DbValues &values) {
-                const char *pkg = "";
-                const char *proc = "";
-                for (int i = 0; i < columns.size(); ++i) {
-                    if (columns[i] == "package_name") pkg = values.get_text(i);
-                    else if (columns[i] == "process") proc = values.get_text(i);
-                }
-                std::string out = std::string(pkg) + "|" + std::string(proc);
-                (void)write_string(fd, out);
-            };
-            (void)db_exec("SELECT package_name, process FROM denylist", {}, cb);
-            (void)write_string(fd, "");
-            break;
-        }
-        default:
-            // Unknown request code
-            write_pod_i32(fd, DenyResponse::ERROR);
-            break;
-    }
+    // Reuse the existing denylist handler implementation (enable/disable/logcat, list framing, etc.)
+    denylist_handler(fd);
 }
 
 static void handle_sqlite_cmd(int fd) {
@@ -1177,10 +1059,18 @@ static void handle_zygisk_cmd(int fd) {
     if (denylist_enforced.load(std::memory_order_relaxed)) {
         flags |= ZygiskStateFlags::DenyListEnforced;
     }
-    // TODO: ProcessOnDenyList and ProcessIsMagiskApp parity.
+    if (!process.empty() && is_deny_target(uid, process)) {
+        flags |= ZygiskStateFlags::ProcessOnDenyList;
+    }
+    {
+        std::string pkg = db_get_string_value("requester");
+        if (pkg.empty()) pkg = JAVA_PACKAGE_NAME;
+        if (!pkg.empty() && (process == pkg || process.starts_with(pkg + ":"))) {
+            flags |= ZygiskStateFlags::ProcessIsMagiskApp;
+        }
+    }
 
     (void)is64;
-    (void)process;
 
     write_pod_u32(fd, flags);
 }
@@ -1338,7 +1228,12 @@ static void handle_client(int cfd) {
             break;
         }
         case RequestCode::STOP_DAEMON: {
-            // Match daemon.rs: write 0 then exit.
+            // Match legacy daemon behavior:
+            // - best-effort unmount Magisk tmpfs / module mounts
+            // - return 0 to the caller
+            // - terminate the daemon
+            denylist_handler(-1);
+            unlink(sock_path().c_str());
             write_pod_i32(cfd, 0);
             _exit(0);
         }
@@ -1354,9 +1249,21 @@ static void handle_client(int cfd) {
             handle_zygisk_cmd(cfd);
             break;
         }
+        case RequestCode::REMOVE_MODULES: {
+            // Best-effort: disable all modules; optionally reboot.
+            int32_t do_reboot = 0;
+            (void) read_pod_i32(cfd, do_reboot);
+            disable_all_modules_cpp();
+            write_pod_i32(cfd, 0);
+            if (do_reboot) {
+                (void) exec_command_sync("/system/bin/reboot");
+            }
+            break;
+        }
         case RequestCode::ZYGOTE_RESTART: {
             // Bring-up: perform core maintenance work.
             prune_su_policies();
+            scan_deny_apps();
             break;
         }
         case RequestCode::POST_FS_DATA:
@@ -1426,7 +1333,7 @@ extern "C" int magiskd_cpp_entry() {
         }
     }
 
-    // Initialize denylist cached state from DB so status/zygisk flags reflect reality.
+    // Initialize denylist state from DB so status/zygisk flags reflect reality.
     init_denylist_state_from_db();
 
     // Ensure directory exists: <tmp> + DEVICEDIR (".magisk/device")
@@ -1457,6 +1364,7 @@ extern "C" int magiskd_cpp_entry() {
 
     // Be permissive for bring-up; Magiskd applies SELinux labeling in Rust.
     chmod(path.c_str(), 0666);
+    (void) lsetxattr(path.c_str(), "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON), 0);
 
     if (listen(sfd, 64) < 0) {
         PLOGE("listen");

@@ -59,7 +59,6 @@ void denylist_handler(int client) {
         break;
     }
     write_int(client, res);
-    close(client);
 }
 
 int denylist_cli(const std::vector<std::string> &args) {

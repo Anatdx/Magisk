@@ -346,7 +346,6 @@ void ls_list(int client) {
         }
     }
     write_int(client, 0);
-    close(client);
 }
 
 int enable_deny() {

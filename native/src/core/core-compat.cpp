@@ -5,6 +5,7 @@
 #include <sys/xattr.h>
 #include <sys/ioctl.h>
 #include <sys/system_properties.h>
+#include <sys/mount.h>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -14,6 +15,7 @@
 #include <cerrno>
 #include <cinttypes>
 #include <cstring>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -150,9 +152,114 @@ int32_t zygisk_get_logd() noexcept { return -1; }
 bool zygisk_should_load_module(uint32_t) noexcept { return false; }
 
 // -------------------------------------------------------------------------
-// Denylist unmount revert (stub for now; full behavior lives in daemon side)
+// Denylist unmount revert
+// Ported from historical `deny/revert.cpp` and `mount.rs::revert_unmount`.
 
-void revert_unmount(int) noexcept {}
+struct MountInfoLite {
+    std::string root;
+    std::string target;
+    std::string source;
+};
+
+static std::vector<MountInfoLite> parse_mount_info_lite(std::string_view pid) {
+    std::vector<MountInfoLite> out;
+    std::string path = "/proc/";
+    path.append(pid.data(), pid.size());
+    path += "/mountinfo";
+
+    std::string content = full_read(path.c_str());
+    if (content.empty()) return out;
+
+    auto next_tok = [](const std::string &s, size_t &pos, std::string_view &tok) -> bool {
+        while (pos < s.size() && std::isspace(static_cast<unsigned char>(s[pos]))) ++pos;
+        if (pos >= s.size()) return false;
+        size_t start = pos;
+        while (pos < s.size() && !std::isspace(static_cast<unsigned char>(s[pos]))) ++pos;
+        tok = std::string_view(s.data() + start, pos - start);
+        return true;
+    };
+
+    size_t off = 0;
+    while (off < content.size()) {
+        size_t eol = content.find('\n', off);
+        if (eol == std::string::npos) eol = content.size();
+        std::string line = content.substr(off, eol - off);
+        off = (eol == content.size()) ? eol : eol + 1;
+        if (line.empty()) continue;
+
+        size_t pos = 0;
+        std::string_view id, parent, dev, root, target, vfs_opt;
+        if (!next_tok(line, pos, id) ||
+            !next_tok(line, pos, parent) ||
+            !next_tok(line, pos, dev) ||
+            !next_tok(line, pos, root) ||
+            !next_tok(line, pos, target) ||
+            !next_tok(line, pos, vfs_opt)) {
+            continue;
+        }
+        std::string_view tok;
+        while (next_tok(line, pos, tok)) {
+            if (tok == "-") break;
+        }
+        std::string_view fs_type, source, fs_opt;
+        if (!next_tok(line, pos, fs_type) || !next_tok(line, pos, source) || !next_tok(line, pos, fs_opt)) {
+            continue;
+        }
+        out.push_back(MountInfoLite{
+            .root = std::string(root),
+            .target = std::string(target),
+            .source = std::string(source),
+        });
+    }
+    return out;
+}
+
+static void lazy_unmount(const char *mountpoint) {
+    if (umount2(mountpoint, MNT_DETACH) == 0) {
+        LOGD("denylist: Unmounted (%s)\n", mountpoint);
+    }
+}
+
+void revert_unmount(int pid) noexcept {
+    int orig_ns = xopen("/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
+    run_finally restore([&] {
+        if (orig_ns >= 0) {
+            (void) xsetns(orig_ns, 0);
+            close(orig_ns);
+        }
+    });
+
+    if (pid >= 0) {
+        char ns_path[64];
+        ssprintf(ns_path, sizeof(ns_path), "/proc/%d/ns/mnt", pid);
+        int ns_fd = xopen(ns_path, O_RDONLY | O_CLOEXEC);
+        if (ns_fd < 0) return;
+        (void) xsetns(ns_fd, 0);
+        close(ns_fd);
+    }
+
+    std::set<std::string> targets;
+    for (auto &info : parse_mount_info_lite("self")) {
+        // Unmount Magisk tmpfs and mounts from module files.
+        if (info.source == "magisk" || info.root.starts_with("/adb/modules")) {
+            targets.insert(std::move(info.target));
+        }
+    }
+
+    if (targets.empty()) return;
+
+    // De-duplicate nested mount points: keep only the shallowest paths.
+    auto last_target = *targets.cbegin() + '/';
+    for (auto it = std::next(targets.cbegin()); it != targets.cend();) {
+        if (it->starts_with(last_target)) {
+            it = targets.erase(it);
+        } else {
+            last_target = *it++ + '/';
+        }
+    }
+
+    for (auto &t : targets) lazy_unmount(t.c_str());
+}
 
 // -------------------------------------------------------------------------
 // FD passing (match Rust socket.rs framing: i32 count + SCM_RIGHTS)
