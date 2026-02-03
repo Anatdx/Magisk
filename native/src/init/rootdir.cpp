@@ -245,7 +245,7 @@ static void extract_files(bool sbin) {
         unxz(fd, magisk);
         // Align with Rust base fd_set_secontext: set context on fd before close (len+1 for NUL).
         if (fsetxattr(fd, "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0) != 0 && sbin)
-            (void)lsetxattr(PRE_TMPDIR "/magisk", "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0);
+            (void)lsetxattr("/magisk/tmp/magisk", "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0);
         close(fd);
     }
     if (access(stub_xz, F_OK) == 0) {
