@@ -227,7 +227,11 @@ static void recreate_sbin(const char *mirror, bool use_bind_mount) {
 
                 xmount(buf, sbin_path.data(), nullptr, MS_BIND, nullptr);
             } else {
-                xsymlink(buf, sbin_path.data());
+                // Keep /sbin/magisk as the binary from the tmpfs we MS_MOVE'd (it has
+                // magisk_file context). Symlinking to /root/magisk would use the rootfs inode
+                // which can stay tmpfs:s0 and cause avc: denied { execute } for untrusted_app.
+                if (strcmp(entry->d_name, "magisk") != 0)
+                    xsymlink(buf, sbin_path.data());
             }
         }
     }
@@ -403,7 +407,8 @@ int magisk_proxy_main(int, char *argv[]) {
     rmdir(PRE_TMPDIR);
     rmdir(PRE_TMPSRC);
 
-    // Create symlinks pointing back to /root
+    // Create symlinks pointing back to /root (magisk is skipped so /sbin/magisk stays
+    // the tmpfs binary with magisk_file context; see recreate_sbin).
     recreate_sbin("/root", false);
 
     // Tell magiskd to remount rootfs
