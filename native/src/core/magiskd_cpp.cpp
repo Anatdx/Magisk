@@ -1479,8 +1479,9 @@ extern "C" int magiskd_cpp_entry() {
             std::string devd = tmp + "/" DEVICEDIR;     // ".magisk/device"
             (void)chmod(intl.c_str(), 0711);
             (void)chmod(devd.c_str(), 0711);
-            (void)lsetxattr(intl.c_str(), "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON), 0);
-            (void)lsetxattr(devd.c_str(), "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON), 0);
+            // Align with Rust base set_secontext: value size must include NUL (len+1).
+            (void)lsetxattr(intl.c_str(), "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0);
+            (void)lsetxattr(devd.c_str(), "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0);
         }
     }
 

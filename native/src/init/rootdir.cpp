@@ -244,7 +244,8 @@ static void extract_files(bool sbin) {
         int fd = xopen("magisk", O_WRONLY | O_CREAT, 0755);
         unxz(fd, magisk);
         // Align with Rust base fd_set_secontext: set context on fd before close (len+1 for NUL).
-        (void)fsetxattr(fd, "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0);
+        if (fsetxattr(fd, "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0) != 0 && sbin)
+            (void)lsetxattr(PRE_TMPDIR "/magisk", "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0);
         close(fd);
     }
     if (access(stub_xz, F_OK) == 0) {
@@ -326,10 +327,29 @@ void MagiskInit::patch_ro_root() noexcept {
     }
     if (p) patch_fissiond(tmp_dir.data());
 
-    // Extract overlay archives
+    // Extract overlay archives. For AVD / patch_ro_root with /sbin, extract magisk to a tmpfs
+    // with context=MAGISK_FILE_CON and bind-mount to /sbin/magisk so untrusted_app can execute it
+    // without relying on setxattr (which may fail on some ramdisk or before policy load).
+    if (tmp_dir == "/sbin" && access("/sbin/magisk.xz", F_OK) == 0) {
+        string magisk_bin_dir = tmp_dir + "/" INTLROOT "/magisk_bin";
+        xmkdirs(magisk_bin_dir.c_str(), 0755);
+        char tmpfs_opts[256]{};
+        ssprintf(tmpfs_opts, sizeof(tmpfs_opts), "mode=755,context=%s", MAGISK_FILE_CON);
+        xmount("tmpfs", magisk_bin_dir.c_str(), "tmpfs", 0, tmpfs_opts);
+        {
+            mmap_data magisk("/sbin/magisk.xz");
+            unlink("/sbin/magisk.xz");
+            string magisk_path = magisk_bin_dir + "/magisk";
+            int fd = xopen(magisk_path.c_str(), O_WRONLY | O_CREAT, 0755);
+            unxz(fd, magisk);
+            (void)fsetxattr(fd, "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0);
+            close(fd);
+        }
+        xmount((magisk_bin_dir + "/magisk").c_str(), "/sbin/magisk", nullptr, MS_BIND, nullptr);
+    }
     extract_files(false);
 
-    // Set magisk_file context on the extracted magisk binary (patch_ro_root path; align with Rust set_secontext).
+    // Set magisk_file context on the extracted magisk binary when not using tmpfs bind-mount above.
     {
         string magisk_path = tmp_dir + "/magisk";
         if (access(magisk_path.c_str(), F_OK) == 0 &&
