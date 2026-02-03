@@ -404,11 +404,14 @@ int magisk_proxy_main(int, char *argv[]) {
     rmdir(PRE_TMPSRC);
 
     // Create symlinks pointing back to /root (align with upstream rootdir.cpp).
+    // /root only contains what link_path(/sbin, /root) saw (magisk.xz, stub.xz, etc.), not
+    // /sbin/magisk (created later by cp_afc). So recreate_sbin does NOT overwrite /sbin/magisk;
+    // the executed binary is the one from the tmpfs we MS_MOVE'd (from extract_files(true)).
     recreate_sbin("/root", false);
 
-    // Exec resolves /sbin/magisk -> /root/magisk. Set magisk_file context on the actual
-    // binary inode (Rust set_secontext: len+1).
-    (void)lsetxattr("/root/magisk", "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0);
+    // Set magisk_file context on the binary that is actually executed (/sbin/magisk on tmpfs).
+    // Rust set_secontext uses len+1 for NUL.
+    (void)lsetxattr("/sbin/magisk", "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0);
 
     // Tell magiskd to remount rootfs
     setenv("REMOUNT_ROOT", "1", 1);
