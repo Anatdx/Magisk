@@ -243,10 +243,9 @@ static void extract_files(bool sbin) {
         unlink(magisk_xz);
         int fd = xopen("magisk", O_WRONLY | O_CREAT, 0755);
         unxz(fd, magisk);
+        // Align with Rust base fd_set_secontext: set context on fd before close (len+1 for NUL).
+        (void)fsetxattr(fd, "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0);
         close(fd);
-        // Align with Rust base set_secontext: value size must include NUL (len+1).
-        // Label as magisk_file so untrusted apps can execute the `su` applet.
-        (void)lsetxattr("magisk", "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0);
     }
     if (access(stub_xz, F_OK) == 0) {
         mmap_data stub(stub_xz);
@@ -409,9 +408,14 @@ int magisk_proxy_main(int, char *argv[]) {
     // the executed binary is the one from the tmpfs we MS_MOVE'd (from extract_files(true)).
     recreate_sbin("/root", false);
 
-    // Set magisk_file context on the binary that is actually executed (/sbin/magisk on tmpfs).
-    // Rust set_secontext uses len+1 for NUL.
-    (void)lsetxattr("/sbin/magisk", "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0);
+    // Set magisk_file context on the binary we are about to exec (Rust fd_set_secontext: len+1).
+    {
+        int fd = open("/sbin/magisk", O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            (void)fsetxattr(fd, "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0);
+            close(fd);
+        }
+    }
 
     // Tell magiskd to remount rootfs
     setenv("REMOUNT_ROOT", "1", 1);
