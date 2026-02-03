@@ -227,11 +227,7 @@ static void recreate_sbin(const char *mirror, bool use_bind_mount) {
 
                 xmount(buf, sbin_path.data(), nullptr, MS_BIND, nullptr);
             } else {
-                // Keep /sbin/magisk as the binary from the tmpfs we MS_MOVE'd (it has
-                // magisk_file context). Symlinking to /root/magisk would use the rootfs inode
-                // which can stay tmpfs:s0 and cause avc: denied { execute } for untrusted_app.
-                if (strcmp(entry->d_name, "magisk") != 0)
-                    xsymlink(buf, sbin_path.data());
+                xsymlink(buf, sbin_path.data());
             }
         }
     }
@@ -248,10 +244,9 @@ static void extract_files(bool sbin) {
         int fd = xopen("magisk", O_WRONLY | O_CREAT, 0755);
         unxz(fd, magisk);
         close(fd);
-        // `magisk` lives on tmpfs during early boot; make sure it's labeled as
-        // Magisk file type so untrusted apps can execute the `su` applet.
-        // Otherwise, tests fail with: avc: denied { execute } ... tcontext=u:object_r:tmpfs:s0
-        (void)lsetxattr("magisk", "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON), 0);
+        // Align with Rust base set_secontext: value size must include NUL (len+1).
+        // Label as magisk_file so untrusted apps can execute the `su` applet.
+        (void)lsetxattr("magisk", "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0);
     }
     if (access(stub_xz, F_OK) == 0) {
         mmap_data stub(stub_xz);
@@ -385,9 +380,10 @@ void MagiskInit::patch_rw_root() noexcept {
 
     chdir("/");
 
-    // Dump magiskinit as magisk
+    // Dump magiskinit as magisk. /sbin/magisk and /root/magisk are hardlinks (same inode);
+    // set context on that inode (Rust set_secontext uses len+1 for NUL).
     cp_afc(REDIR_PATH, "/sbin/magisk");
-    (void)lsetxattr("/sbin/magisk", "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON), 0);
+    (void)lsetxattr("/sbin/magisk", "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0);
 }
 
 int magisk_proxy_main(int, char *argv[]) {
@@ -407,9 +403,12 @@ int magisk_proxy_main(int, char *argv[]) {
     rmdir(PRE_TMPDIR);
     rmdir(PRE_TMPSRC);
 
-    // Create symlinks pointing back to /root (magisk is skipped so /sbin/magisk stays
-    // the tmpfs binary with magisk_file context; see recreate_sbin).
+    // Create symlinks pointing back to /root (align with upstream rootdir.cpp).
     recreate_sbin("/root", false);
+
+    // Exec resolves /sbin/magisk -> /root/magisk. Set magisk_file context on the actual
+    // binary inode (Rust set_secontext: len+1).
+    (void)lsetxattr("/root/magisk", "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0);
 
     // Tell magiskd to remount rootfs
     setenv("REMOUNT_ROOT", "1", 1);

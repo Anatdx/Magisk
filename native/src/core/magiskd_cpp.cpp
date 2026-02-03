@@ -1509,7 +1509,7 @@ extern "C" int magiskd_cpp_entry() {
 
     // Be permissive for bring-up; Magiskd applies SELinux labeling in Rust.
     chmod(path.c_str(), 0666);
-    (void) lsetxattr(path.c_str(), "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON), 0);
+    (void) lsetxattr(path.c_str(), "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0);
 
     if (listen(sfd, 64) < 0) {
         PLOGE("listen");

@@ -422,7 +422,9 @@ bool lgetfilecon(Utf8CStr path, byte_data con) noexcept {
 }
 
 bool setfilecon(Utf8CStr path, Utf8CStr con) noexcept {
-    return lsetxattr(path.c_str(), "security.selinux", con.c_str(), strlen(con.c_str()), 0) == 0;
+    // Align with Rust base set_secontext: value size must include NUL.
+    size_t len = strlen(con.c_str());
+    return lsetxattr(path.c_str(), "security.selinux", con.c_str(), len + 1, 0) == 0;
 }
 
 // -------------------------------------------------------------------------
