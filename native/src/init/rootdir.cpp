@@ -329,6 +329,14 @@ void MagiskInit::patch_ro_root() noexcept {
     // Extract overlay archives
     extract_files(false);
 
+    // Set magisk_file context on the extracted magisk binary (patch_ro_root path; align with Rust set_secontext).
+    {
+        string magisk_path = tmp_dir + "/magisk";
+        if (access(magisk_path.c_str(), F_OK) == 0 &&
+            lsetxattr(magisk_path.c_str(), "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0) != 0)
+            PLOGE("lsetxattr %s", magisk_path.c_str());
+    }
+
     handle_sepolicy();
     unlink("init-ld");
 
@@ -408,14 +416,21 @@ int magisk_proxy_main(int, char *argv[]) {
     // the executed binary is the one from the tmpfs we MS_MOVE'd (from extract_files(true)).
     recreate_sbin("/root", false);
 
-    // Set magisk_file context on the binary we are about to exec (Rust fd_set_secontext: len+1).
-    {
-        int fd = open("/sbin/magisk", O_RDONLY | O_CLOEXEC);
-        if (fd >= 0) {
-            (void)fsetxattr(fd, "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0);
-            close(fd);
-        }
+    // Set magisk_file context on /sbin/magisk (align with Rust fd_set_secontext/set_secontext: len+1).
+    // Try fsetxattr first; fallback to lsetxattr so untrusted_app can execute this binary.
+    bool ctx_ok = false;
+    int fd = open("/sbin/magisk", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        if (fsetxattr(fd, "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0) == 0)
+            ctx_ok = true;
+        else
+            PLOGE("fsetxattr /sbin/magisk");
+        close(fd);
+    } else {
+        PLOGE("open /sbin/magisk");
     }
+    if (!ctx_ok && lsetxattr("/sbin/magisk", "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0) != 0)
+        PLOGE("lsetxattr /sbin/magisk");
 
     // Tell magiskd to remount rootfs
     setenv("REMOUNT_ROOT", "1", 1);
