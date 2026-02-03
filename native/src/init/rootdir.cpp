@@ -327,25 +327,28 @@ void MagiskInit::patch_ro_root() noexcept {
     }
     if (p) patch_fissiond(tmp_dir.data());
 
-    // Extract overlay archives. For AVD / patch_ro_root with /sbin, extract magisk to a tmpfs
-    // with context=MAGISK_FILE_CON and bind-mount to /sbin/magisk so untrusted_app can execute it
-    // without relying on setxattr (which may fail on some ramdisk or before policy load).
-    if (tmp_dir == "/sbin" && access("/sbin/magisk.xz", F_OK) == 0) {
+    // Extract overlay archives. For AVD / patch_ro_root, extract magisk to a tmpfs with
+    // context=MAGISK_FILE_CON and bind-mount so init/magiskd and untrusted_app can execute it
+    // without relying on setxattr (which may fail on ramdisk or before policy load).
+    // When tmp_dir is /sbin: bind to /sbin/magisk. When tmp_dir is /debug_ramdisk: bind to tmp_dir/magisk.
+    const char *magisk_xz_path = (tmp_dir == "/sbin") ? "/sbin/magisk.xz" : "magisk.xz";
+    if (access(magisk_xz_path, F_OK) == 0) {
         string magisk_bin_dir = tmp_dir + "/" INTLROOT "/magisk_bin";
         xmkdirs(magisk_bin_dir.c_str(), 0755);
         char tmpfs_opts[256]{};
         ssprintf(tmpfs_opts, sizeof(tmpfs_opts), "mode=755,context=%s", MAGISK_FILE_CON);
         xmount("tmpfs", magisk_bin_dir.c_str(), "tmpfs", 0, tmpfs_opts);
         {
-            mmap_data magisk("/sbin/magisk.xz");
-            unlink("/sbin/magisk.xz");
+            mmap_data magisk(magisk_xz_path);
+            unlink(magisk_xz_path);
             string magisk_path = magisk_bin_dir + "/magisk";
             int fd = xopen(magisk_path.c_str(), O_WRONLY | O_CREAT, 0755);
             unxz(fd, magisk);
             (void)fsetxattr(fd, "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0);
             close(fd);
         }
-        xmount((magisk_bin_dir + "/magisk").c_str(), "/sbin/magisk", nullptr, MS_BIND, nullptr);
+        string bind_target = (tmp_dir == "/sbin") ? "/sbin/magisk" : (tmp_dir + "/magisk");
+        xmount((magisk_bin_dir + "/magisk").c_str(), bind_target.c_str(), nullptr, MS_BIND, nullptr);
     }
     extract_files(false);
 
