@@ -1,6 +1,7 @@
 #include <sys/mount.h>
 #include <sys/xattr.h>
 #include <libgen.h>
+#include <cerrno>
 #include <cstring>
 
 #include <sepolicy.hpp>
@@ -327,18 +328,18 @@ void MagiskInit::patch_ro_root() noexcept {
     }
     if (p) patch_fissiond(tmp_dir.data());
 
-    // Extract overlay archives. For AVD / patch_ro_root, extract magisk to a tmpfs with
-    // context=MAGISK_FILE_CON and bind-mount so init/magiskd and untrusted_app can execute it
-    // without relying on setxattr (which may fail on ramdisk or before policy load).
-    // When tmp_dir is /sbin: bind to /sbin/magisk. When tmp_dir is /debug_ramdisk: bind to tmp_dir/magisk.
+    // Extract overlay archives. For AVD / patch_ro_root, try to extract magisk to a tmpfs with
+    // context=MAGISK_FILE_CON and bind-mount so init/magiskd and untrusted_app can execute it.
+    // When SELinux is not yet initialized, tmpfs with context= fails with EINVAL; then fall back
+    // to normal extract so /debug_ramdisk/magisk (or /sbin/magisk) still exists and lsetxattr is tried later.
     const char *magisk_xz_path = (tmp_dir == "/sbin") ? "/sbin/magisk.xz" : "magisk.xz";
     if (access(magisk_xz_path, F_OK) == 0) {
         string magisk_bin_dir = tmp_dir + "/" INTLROOT "/magisk_bin";
         xmkdirs(magisk_bin_dir.c_str(), 0755);
         char tmpfs_opts[256]{};
         ssprintf(tmpfs_opts, sizeof(tmpfs_opts), "mode=755,context=%s", MAGISK_FILE_CON);
-        xmount("tmpfs", magisk_bin_dir.c_str(), "tmpfs", 0, tmpfs_opts);
-        {
+        bool tmpfs_ok = (mount("tmpfs", magisk_bin_dir.c_str(), "tmpfs", 0, tmpfs_opts) == 0);
+        if (tmpfs_ok) {
             mmap_data magisk(magisk_xz_path);
             unlink(magisk_xz_path);
             string magisk_path = magisk_bin_dir + "/magisk";
@@ -346,9 +347,10 @@ void MagiskInit::patch_ro_root() noexcept {
             unxz(fd, magisk);
             (void)fsetxattr(fd, "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0);
             close(fd);
+            string bind_target = (tmp_dir == "/sbin") ? "/sbin/magisk" : (tmp_dir + "/magisk");
+            xmount((magisk_bin_dir + "/magisk").c_str(), bind_target.c_str(), nullptr, MS_BIND, nullptr);
         }
-        string bind_target = (tmp_dir == "/sbin") ? "/sbin/magisk" : (tmp_dir + "/magisk");
-        xmount((magisk_bin_dir + "/magisk").c_str(), bind_target.c_str(), nullptr, MS_BIND, nullptr);
+        // If tmpfs failed (e.g. EINVAL before SELinux init), magisk.xz is left for extract_files(false)
     }
     extract_files(false);
 
