@@ -179,6 +179,9 @@ sqlite3 *open_and_init_db() {
         return nullptr;
     }
 
+    // Ensure SECURE_DIR exists before opening the DB (daemon may open DB before POST_FS_DATA).
+    (void)mkdirs(SECURE_DIR, 0700);
+
     unique_ptr<sqlite3, decltype(sqlite3_close)> db(nullptr, sqlite3_close);
     {
         sqlite3 *sql;
