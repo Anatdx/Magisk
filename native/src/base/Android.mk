@@ -16,3 +16,16 @@ LOCAL_SRC_FILES := \
     base-rs.cpp \
     ../external/cxx-rs/src/cxx.cc
 include $(BUILD_STATIC_LIBRARY)
+
+include $(CLEAR_VARS)
+LOCAL_MODULE := libbase_cpp
+LOCAL_C_INCLUDES := \
+    src/include \
+    $(LOCAL_PATH)/include \
+    out/generated
+LOCAL_EXPORT_C_INCLUDES := $(LOCAL_C_INCLUDES)
+LOCAL_EXPORT_STATIC_LIBRARIES := libcxx
+LOCAL_STATIC_LIBRARIES := libcxx
+LOCAL_SRC_FILES := \
+    base_cpp.cpp
+include $(BUILD_STATIC_LIBRARY)

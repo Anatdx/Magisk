@@ -1,5 +1,8 @@
 #include <sys/mount.h>
+#include <sys/xattr.h>
 #include <libgen.h>
+#include <cerrno>
+#include <cstring>
 
 #include <sepolicy.hpp>
 #include <consts.hpp>
@@ -241,6 +244,9 @@ static void extract_files(bool sbin) {
         unlink(magisk_xz);
         int fd = xopen("magisk", O_WRONLY | O_CREAT, 0755);
         unxz(fd, magisk);
+        // Align with Rust base fd_set_secontext: set context on fd before close (len+1 for NUL).
+        if (fsetxattr(fd, "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0) != 0 && sbin)
+            (void)lsetxattr("/magisk/tmp/magisk", "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0);
         close(fd);
     }
     if (access(stub_xz, F_OK) == 0) {
@@ -322,8 +328,39 @@ void MagiskInit::patch_ro_root() noexcept {
     }
     if (p) patch_fissiond(tmp_dir.data());
 
-    // Extract overlay archives
+    // Extract overlay archives. For AVD / patch_ro_root, try to extract magisk to a tmpfs with
+    // context=MAGISK_FILE_CON and bind-mount so init/magiskd and untrusted_app can execute it.
+    // When SELinux is not yet initialized, tmpfs with context= fails with EINVAL; then fall back
+    // to normal extract so /debug_ramdisk/magisk (or /sbin/magisk) still exists and lsetxattr is tried later.
+    const char *magisk_xz_path = (tmp_dir == "/sbin") ? "/sbin/magisk.xz" : "magisk.xz";
+    if (access(magisk_xz_path, F_OK) == 0) {
+        string magisk_bin_dir = tmp_dir + "/" INTLROOT "/magisk_bin";
+        xmkdirs(magisk_bin_dir.c_str(), 0755);
+        char tmpfs_opts[256]{};
+        ssprintf(tmpfs_opts, sizeof(tmpfs_opts), "mode=755,context=%s", MAGISK_FILE_CON);
+        bool tmpfs_ok = (mount("tmpfs", magisk_bin_dir.c_str(), "tmpfs", 0, tmpfs_opts) == 0);
+        if (tmpfs_ok) {
+            mmap_data magisk(magisk_xz_path);
+            unlink(magisk_xz_path);
+            string magisk_path = magisk_bin_dir + "/magisk";
+            int fd = xopen(magisk_path.c_str(), O_WRONLY | O_CREAT, 0755);
+            unxz(fd, magisk);
+            (void)fsetxattr(fd, "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0);
+            close(fd);
+            string bind_target = (tmp_dir == "/sbin") ? "/sbin/magisk" : (tmp_dir + "/magisk");
+            xmount((magisk_bin_dir + "/magisk").c_str(), bind_target.c_str(), nullptr, MS_BIND, nullptr);
+        }
+        // If tmpfs failed (e.g. EINVAL before SELinux init), magisk.xz is left for extract_files(false)
+    }
     extract_files(false);
+
+    // Set magisk_file context on the extracted magisk binary when not using tmpfs bind-mount above.
+    {
+        string magisk_path = tmp_dir + "/magisk";
+        if (access(magisk_path.c_str(), F_OK) == 0 &&
+            lsetxattr(magisk_path.c_str(), "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0) != 0)
+            PLOGE("lsetxattr %s", magisk_path.c_str());
+    }
 
     handle_sepolicy();
     unlink("init-ld");
@@ -357,7 +394,12 @@ void MagiskInit::patch_rw_root() noexcept {
         patch_fissiond("/sbin");
 
     xmkdir(PRE_TMPSRC, 0);
-    xmount("tmpfs", PRE_TMPSRC, "tmpfs", 0, "mode=755");
+    // IMPORTANT: `magisk` will be extracted onto this tmpfs, and later MS_MOVE'd to /sbin.
+    // If the tmpfs is left as default `tmpfs` label, untrusted apps will be denied executing
+    // the `magisk` binary (used as `su` applet), breaking libsu and CI tests.
+    char tmpfs_opts[256]{};
+    ssprintf(tmpfs_opts, sizeof(tmpfs_opts), "mode=755,context=%s", MAGISK_FILE_CON);
+    xmount("tmpfs", PRE_TMPSRC, "tmpfs", 0, tmpfs_opts);
     xmkdir(PRE_TMPDIR, 0);
     setup_tmp(PRE_TMPDIR);
     chdir(PRE_TMPDIR);
@@ -370,8 +412,10 @@ void MagiskInit::patch_rw_root() noexcept {
 
     chdir("/");
 
-    // Dump magiskinit as magisk
+    // Dump magiskinit as magisk. /sbin/magisk and /root/magisk are hardlinks (same inode);
+    // set context on that inode (Rust set_secontext uses len+1 for NUL).
     cp_afc(REDIR_PATH, "/sbin/magisk");
+    (void)lsetxattr("/sbin/magisk", "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0);
 }
 
 int magisk_proxy_main(int, char *argv[]) {
@@ -391,8 +435,27 @@ int magisk_proxy_main(int, char *argv[]) {
     rmdir(PRE_TMPDIR);
     rmdir(PRE_TMPSRC);
 
-    // Create symlinks pointing back to /root
+    // Create symlinks pointing back to /root (align with upstream rootdir.cpp).
+    // /root only contains what link_path(/sbin, /root) saw (magisk.xz, stub.xz, etc.), not
+    // /sbin/magisk (created later by cp_afc). So recreate_sbin does NOT overwrite /sbin/magisk;
+    // the executed binary is the one from the tmpfs we MS_MOVE'd (from extract_files(true)).
     recreate_sbin("/root", false);
+
+    // Set magisk_file context on /sbin/magisk (align with Rust fd_set_secontext/set_secontext: len+1).
+    // Try fsetxattr first; fallback to lsetxattr so untrusted_app can execute this binary.
+    bool ctx_ok = false;
+    int fd = open("/sbin/magisk", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        if (fsetxattr(fd, "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0) == 0)
+            ctx_ok = true;
+        else
+            PLOGE("fsetxattr /sbin/magisk");
+        close(fd);
+    } else {
+        PLOGE("open /sbin/magisk");
+    }
+    if (!ctx_ok && lsetxattr("/sbin/magisk", "security.selinux", MAGISK_FILE_CON, strlen(MAGISK_FILE_CON) + 1, 0) != 0)
+        PLOGE("lsetxattr /sbin/magisk");
 
     // Tell magiskd to remount rootfs
     setenv("REMOUNT_ROOT", "1", 1);

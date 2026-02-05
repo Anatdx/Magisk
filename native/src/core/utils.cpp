@@ -6,7 +6,7 @@
 #include <map>
 
 #include <consts.hpp>
-#include <base.hpp>
+#include <base_cpp.hpp>
 #include <core.hpp>
 
 using namespace std;
@@ -31,17 +31,16 @@ void write_string(int fd, string_view str) {
 }
 
 const char *get_magisk_tmp() {
-    static const char *path = nullptr;
-    if (path == nullptr) {
-        if (access("/debug_ramdisk/" INTLROOT, F_OK) == 0) {
-            path = "/debug_ramdisk";
-        } else if (access("/sbin/" INTLROOT, F_OK) == 0) {
-            path = "/sbin";
-        } else {
-            path = "";
-        }
+    // Do NOT permanently cache a "not found" result.
+    // During early boot the directory may not exist yet, but will appear later.
+    // If we cache "", daemon start and all IPC can be permanently broken.
+    if (access("/debug_ramdisk/" INTLROOT, F_OK) == 0) {
+        return "/debug_ramdisk";
     }
-    return path;
+    if (access("/sbin/" INTLROOT, F_OK) == 0) {
+        return "/sbin";
+    }
+    return "";
 }
 
 void unlock_blocks() {

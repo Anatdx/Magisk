@@ -1,6 +1,6 @@
 #include <dlfcn.h>
 
-#include <base.hpp>
+#include <base_cpp.hpp>
 #include <core.hpp>
 
 #include <api/system_properties.h>

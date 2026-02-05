@@ -9,30 +9,51 @@ ifdef B_MAGISK
 include $(CLEAR_VARS)
 LOCAL_MODULE := magisk
 LOCAL_STATIC_LIBRARIES := \
-    libbase \
+    libbase_cpp \
     libsystemproperties \
-    liblsplt \
-    libmagisk-rs
+    liblsplt
 
 LOCAL_SRC_FILES := \
     core/applets.cpp \
     core/scripting.cpp \
     core/sqlite.cpp \
     core/utils.cpp \
-    core/core-rs.cpp \
+    core/magiskd_cpp.cpp \
+    core/core-compat.cpp \
     core/resetprop/sys.cpp \
     core/su/su.cpp \
-    core/zygisk/entry.cpp \
-    core/zygisk/module.cpp \
-    core/zygisk/hook.cpp \
+    core/zygisk_stub.cpp \
     core/deny/cli.cpp \
     core/deny/utils.cpp \
     core/deny/logcat.cpp
+
+LOCAL_C_INCLUDES := \
+    $(LOCAL_PATH)/core/include
 
 LOCAL_LDLIBS := -llog
 LOCAL_LDFLAGS := -Wl,--dynamic-list=src/exported_sym.txt
 
 include $(BUILD_EXECUTABLE)
+
+ifdef MAGISK_CPP_DAEMON
+include $(CLEAR_VARS)
+LOCAL_MODULE := magiskd-cpp
+LOCAL_STATIC_LIBRARIES := \
+    libbase_cpp
+
+LOCAL_SRC_FILES := \
+    core/magiskd_cpp.cpp \
+    core/sqlite.cpp
+
+LOCAL_C_INCLUDES := \
+    $(LOCAL_PATH)/core/include
+
+LOCAL_CFLAGS += -DMAGISKD_CPP_STANDALONE
+
+LOCAL_LDLIBS := -llog
+
+include $(BUILD_EXECUTABLE)
+endif
 
 endif
 
@@ -60,6 +81,7 @@ LOCAL_SRC_FILES := \
     init/mount.cpp \
     init/rootdir.cpp \
     init/getinfo.cpp \
+    init/init_cpp_port.cpp \
     init/init-rs.cpp
 
 LOCAL_LDFLAGS := -static
@@ -115,14 +137,16 @@ ifdef B_PROP
 include $(CLEAR_VARS)
 LOCAL_MODULE := resetprop
 LOCAL_STATIC_LIBRARIES := \
-    libbase \
-    libsystemproperties \
-    libmagisk-rs
+    libbase_cpp \
+    libsystemproperties
 
 LOCAL_SRC_FILES := \
     core/applet_stub.cpp \
     core/resetprop/sys.cpp \
-    core/core-rs.cpp
+    core/core-compat.cpp
+
+LOCAL_C_INCLUDES := \
+    $(LOCAL_PATH)/core/include
 
 LOCAL_CFLAGS := -DAPPLET_STUB_MAIN=resetprop_main
 include $(BUILD_EXECUTABLE)

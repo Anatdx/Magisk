@@ -62,7 +62,14 @@ wait_for_boot() {
 wait_emu() {
   local which_pid
 
-  timeout $boot_timeout bash -c wait_for_boot &
+  if command -v timeout >/dev/null 2>&1; then
+    timeout $boot_timeout bash -c wait_for_boot &
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout $boot_timeout bash -c wait_for_boot &
+  else
+    # macOS does not ship `timeout` by default.
+    perl -e 'alarm shift; exec @ARGV' $boot_timeout bash -c wait_for_boot &
+  fi
   local wait_pid=$!
 
   # Handle the case when emulator dies earlier than timeout

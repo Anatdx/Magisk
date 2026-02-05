@@ -5,6 +5,7 @@ edition.workspace = true
 
 [lib]
 path = "lib.rs"
+crate-type = ["rlib", "staticlib"]
 
 [features]
 selinux = []

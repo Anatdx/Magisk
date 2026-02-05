@@ -3,7 +3,7 @@
 #include <sys/wait.h>
 
 #include <consts.hpp>
-#include <base.hpp>
+#include <base_cpp.hpp>
 #include <core.hpp>
 
 using namespace std;
@@ -116,7 +116,7 @@ static bool operator>(const timespec &a, const timespec &b) {
     return a.tv_nsec > b.tv_nsec;
 }
 
-void exec_module_scripts(Utf8CStr stage, const rust::Vec<ModuleInfo> &module_list) {
+void exec_module_scripts(Utf8CStr stage, const std::vector<ModuleInfo> &module_list) {
     LOGI("* Running module %s scripts\n", stage.c_str());
     if (module_list.empty())
         return;

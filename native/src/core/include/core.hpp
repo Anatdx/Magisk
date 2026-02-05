@@ -5,9 +5,9 @@
 #include <atomic>
 #include <functional>
 
-#include <base.hpp>
+#include <base_cpp.hpp>
 
-#include "../core-rs.hpp"
+#include "../core-compat.hpp"
 
 #define AID_ROOT   0
 #define AID_SHELL  2000
@@ -20,7 +20,9 @@
 #define APP_DATA_DIR (SDK_INT >= 24 ? "/data/user_de" : "/data/user")
 
 inline int connect_daemon(RequestCode req) {
-    return connect_daemon(req, false);
+    // Default behavior should match upstream: if the socket isn't up yet,
+    // attempt to spawn `magiskd` (works because MagiskSU is suid-root).
+    return connect_daemon(req, true);
 }
 
 // Multi-call entrypoints
@@ -66,26 +68,22 @@ bool read_vector(int fd, std::vector<T> &vec) {
 void install_apk(Utf8CStr apk);
 void uninstall_pkg(Utf8CStr pkg);
 void exec_common_scripts(Utf8CStr stage);
-void exec_module_scripts(Utf8CStr stage, const rust::Vec<ModuleInfo> &module_list);
+void exec_module_scripts(Utf8CStr stage, const std::vector<ModuleInfo> &module_list);
 void exec_script(Utf8CStr script);
 void clear_pkg(const char *pkg, int user_id);
 [[noreturn]] void install_module(Utf8CStr file);
 
 // Denylist
 extern std::atomic<bool> denylist_enforced;
-int denylist_cli(rust::Vec<rust::String> &args);
+int denylist_cli(const std::vector<std::string> &args);
 void denylist_handler(int client);
 void initialize_denylist();
 void scan_deny_apps();
 bool is_deny_target(int uid, std::string_view process);
 void revert_unmount(int pid = -1) noexcept;
-void update_deny_flags(int uid, rust::Str process, uint32_t &flags);
+void update_deny_flags(int uid, std::string_view process, uint32_t &flags);
 
 // MagiskSU
 void exec_root_shell(int client, int pid, SuRequest &req, MntNsMode mode);
 
-// Rust bindings
-inline Utf8CStr get_magisk_tmp_rs() { return get_magisk_tmp(); }
-inline rust::String resolve_preinit_dir_rs(Utf8CStr base_dir) {
-    return resolve_preinit_dir(base_dir.c_str());
-}
+// (Rust bindings removed in core C++ migration)

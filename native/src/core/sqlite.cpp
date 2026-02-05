@@ -1,7 +1,9 @@
 #include <dlfcn.h>
 
+#include <mutex>
+
 #include <consts.hpp>
-#include <base.hpp>
+#include <base_cpp.hpp>
 #include <sqlite.hpp>
 
 using namespace std;
@@ -93,56 +95,53 @@ static bool load_sqlite() {
     return true;
 }
 
-using StringVec = rust::Vec<rust::String>;
-using sql_bind_callback_real = int(*)(void*, int, sqlite3_stmt*);
-using sql_exec_callback_real = void(*)(void*, StringSlice, sqlite3_stmt*);
-
 #define sql_chk(fn, ...) if (int rc = fn(__VA_ARGS__); rc != SQLITE_OK) return rc
 
-// Exports to Rust
-extern "C" int sql_exec_impl(
-        sqlite3 *db, rust::Str zSql,
-        sql_bind_callback bind_cb = nullptr, void *bind_cookie = nullptr,
-        sql_exec_callback exec_cb = nullptr, void *exec_cookie = nullptr) {
-    const char *sql = zSql.begin();
+static int sql_exec_impl(
+        sqlite3 *db, std::string_view zSql,
+        DbArgs *bind_args = nullptr,
+        db_exec_callback *exec_fn = nullptr) {
+    const char *sql = zSql.data();
+    const char *sql_end = zSql.data() + zSql.size();
     unique_ptr<sqlite3_stmt, decltype(sqlite3_finalize)> stmt(nullptr, sqlite3_finalize);
 
-    while (sql != zSql.end()) {
+    while (sql < sql_end) {
         // Step 1: prepare statement
         {
             sqlite3_stmt *st = nullptr;
-            sql_chk(sqlite3_prepare_v2, db, sql, zSql.end() - sql, &st, &sql);
+            sql_chk(sqlite3_prepare_v2, db, sql, static_cast<int>(sql_end - sql), &st, &sql);
             if (st == nullptr) continue;
             stmt.reset(st);
         }
 
         // Step 2: bind arguments
-        if (bind_cb) {
+        if (bind_args && !bind_args->empty()) {
             if (int count = sqlite3_bind_parameter_count(stmt.get())) {
-                auto real_cb = reinterpret_cast<sql_bind_callback_real>(bind_cb);
+                auto &st = *reinterpret_cast<DbStatement *>(stmt.get());
                 for (int i = 1; i <= count; ++i) {
-                    sql_chk(real_cb, bind_cookie, i, stmt.get());
+                    int rc = (*bind_args)(i, st);
+                    if (rc != SQLITE_OK) return rc;
                 }
             }
         }
 
         // Step 3: execute
         bool first = true;
-        StringVec columns;
+        ColumnList columns;
         for (;;) {
             int rc = sqlite3_step(stmt.get());
             if (rc == SQLITE_DONE) break;
             if (rc != SQLITE_ROW) return rc;
-            if (exec_cb == nullptr) continue;
+            if (exec_fn == nullptr || !(*exec_fn)) continue;
             if (first) {
                 int count = sqlite3_column_count(stmt.get());
                 for (int i = 0; i < count; ++i) {
-                    columns.emplace_back(sqlite3_column_name(stmt.get(), i));
+                    const char *c = sqlite3_column_name(stmt.get(), i);
+                    columns.emplace_back(c ? std::string_view{c} : std::string_view{});
                 }
                 first = false;
             }
-            auto real_cb = reinterpret_cast<sql_exec_callback_real>(exec_cb);
-            real_cb(exec_cookie, StringSlice(columns), stmt.get());
+            (*exec_fn)(columns, *reinterpret_cast<const DbValues *>(stmt.get()));
         }
     }
 
@@ -161,8 +160,10 @@ int DbStatement::bind_int64(int index, int64_t val) {
     return sqlite3_bind_int64(reinterpret_cast<sqlite3_stmt*>(this), index, val);
 }
 
-int DbStatement::bind_text(int index, rust::Str val) {
-    return sqlite3_bind_text(reinterpret_cast<sqlite3_stmt*>(this), index, val.data(), val.size(), nullptr);
+int DbStatement::bind_text(int index, std::string_view val) {
+    auto transient = reinterpret_cast<void(*)(void*)>(-1);
+    return sqlite3_bind_text(reinterpret_cast<sqlite3_stmt*>(this), index, val.data(),
+                             static_cast<int>(val.size()), transient);
 }
 
 #define sql_chk_log_ret(ret, fn, ...) if (int rc = fn(__VA_ARGS__); rc != SQLITE_OK) { \
@@ -178,6 +179,9 @@ sqlite3 *open_and_init_db() {
         return nullptr;
     }
 
+    // Ensure SECURE_DIR exists before opening the DB (daemon may open DB before POST_FS_DATA).
+    (void)mkdirs(SECURE_DIR, 0700);
+
     unique_ptr<sqlite3, decltype(sqlite3_close)> db(nullptr, sqlite3_close);
     {
         sqlite3 *sql;
@@ -189,10 +193,10 @@ sqlite3 *open_and_init_db() {
 
     int ver = 0;
     bool upgrade = false;
-    auto ver_cb = [](void *ver, auto, const DbValues &values) {
-        *static_cast<int *>(ver) = values.get_int(0);
-    };
-    sql_chk_log(sql_exec_impl, db.get(), "PRAGMA user_version", nullptr, nullptr, ver_cb, &ver);
+    {
+        db_exec_callback cb = [&](const ColumnList &, const DbValues &values) { ver = values.get_int(0); };
+        sql_chk_log(sql_exec_impl, db.get(), std::string_view{"PRAGMA user_version"}, nullptr, &cb);
+    }
     if (ver > DB_VERSION) {
         // Don't support downgrading database, delete and retry
         LOGE("sqlite3: Downgrading database is not supported\n");
@@ -201,25 +205,25 @@ sqlite3 *open_and_init_db() {
     }
 
     auto create_policy = [&] {
-        return sql_exec_impl(db.get(),
+        return sql_exec_impl(db.get(), std::string_view{
                 "CREATE TABLE IF NOT EXISTS policies "
                 "(uid INT, policy INT, until INT, logging INT, "
-                "notification INT, PRIMARY KEY(uid))");
+                "notification INT, PRIMARY KEY(uid))"});
     };
     auto create_settings = [&] {
-        return sql_exec_impl(db.get(),
+        return sql_exec_impl(db.get(), std::string_view{
                 "CREATE TABLE IF NOT EXISTS settings "
-                "(key TEXT, value INT, PRIMARY KEY(key))");
+                "(key TEXT, value INT, PRIMARY KEY(key))"});
     };
     auto create_strings = [&] {
-        return sql_exec_impl(db.get(),
+        return sql_exec_impl(db.get(), std::string_view{
                 "CREATE TABLE IF NOT EXISTS strings "
-                "(key TEXT, value TEXT, PRIMARY KEY(key))");
+                "(key TEXT, value TEXT, PRIMARY KEY(key))"});
     };
     auto create_denylist = [&] {
-        return sql_exec_impl(db.get(),
+        return sql_exec_impl(db.get(), std::string_view{
                 "CREATE TABLE IF NOT EXISTS denylist "
-                "(package_name TEXT, process TEXT, PRIMARY KEY(package_name, process))");
+                "(package_name TEXT, process TEXT, PRIMARY KEY(package_name, process))"});
     };
 
     // Database changelog:
@@ -244,45 +248,45 @@ sqlite3 *open_and_init_db() {
         upgrade = true;
     }
     if (ver == 7) {
-        sql_chk_log(sql_exec_impl, db.get(),
+        sql_chk_log(sql_exec_impl, db.get(), std::string_view{
                 "BEGIN TRANSACTION;"
                 "ALTER TABLE hidelist RENAME TO hidelist_tmp;"
                 "CREATE TABLE IF NOT EXISTS hidelist "
                 "(package_name TEXT, process TEXT, PRIMARY KEY(package_name, process));"
                 "INSERT INTO hidelist SELECT process as package_name, process FROM hidelist_tmp;"
                 "DROP TABLE hidelist_tmp;"
-                "COMMIT;");
+                "COMMIT;"});
         // Directly jump to version 9
         ver = 9;
         upgrade = true;
     }
     if (ver == 8) {
-        sql_chk_log(sql_exec_impl, db.get(),
+        sql_chk_log(sql_exec_impl, db.get(), std::string_view{
                 "BEGIN TRANSACTION;"
                 "ALTER TABLE hidelist RENAME TO hidelist_tmp;"
                 "CREATE TABLE IF NOT EXISTS hidelist "
                 "(package_name TEXT, process TEXT, PRIMARY KEY(package_name, process));"
                 "INSERT INTO hidelist SELECT * FROM hidelist_tmp;"
                 "DROP TABLE hidelist_tmp;"
-                "COMMIT;");
+                "COMMIT;"});
         ver = 9;
         upgrade = true;
     }
     if (ver == 9) {
-        sql_chk_log(sql_exec_impl, db.get(), "DROP TABLE IF EXISTS logs", nullptr, nullptr);
+        sql_chk_log(sql_exec_impl, db.get(), std::string_view{"DROP TABLE IF EXISTS logs"});
         ver = 10;
         upgrade = true;
     }
     if (ver == 10) {
-        sql_chk_log(sql_exec_impl, db.get(),
+        sql_chk_log(sql_exec_impl, db.get(), std::string_view{
                 "DROP TABLE IF EXISTS hidelist;"
-                "DELETE FROM settings WHERE key='magiskhide';");
+                "DELETE FROM settings WHERE key='magiskhide';"});
         sql_chk_log(create_denylist);
         ver = 11;
         upgrade = true;
     }
     if (ver == 11) {
-        sql_chk_log(sql_exec_impl, db.get(),
+        sql_chk_log(sql_exec_impl, db.get(), std::string_view{
                 "BEGIN TRANSACTION;"
                 "ALTER TABLE policies RENAME TO policies_tmp;"
                 "CREATE TABLE IF NOT EXISTS policies "
@@ -291,45 +295,30 @@ sqlite3 *open_and_init_db() {
                 "INSERT INTO policies "
                 "SELECT uid, policy, until, logging, notification FROM policies_tmp;"
                 "DROP TABLE policies_tmp;"
-                "COMMIT;");
+                "COMMIT;"});
         ver = 12;
         upgrade = true;
     }
 
     if (upgrade) {
         // Set version
-        sql_chk_log(sql_exec_impl, db.get(), "PRAGMA user_version=" DB_VERSION_STR);
+        sql_chk_log(sql_exec_impl, db.get(), std::string_view{"PRAGMA user_version=" DB_VERSION_STR});
     }
 
     return db.release();
 }
 
-// Exported from Rust
-extern "C" int sql_exec_rs(
-        rust::Str zSql,
-        sql_bind_callback bind_cb, void *bind_cookie,
-        sql_exec_callback exec_cb, void *exec_cookie);
-
 bool db_exec(const char *sql, DbArgs args, db_exec_callback exec_fn) {
-    using db_bind_callback = std::function<int(int, DbStatement&)>;
-
-    db_bind_callback bind_fn = {};
-    sql_bind_callback bind_cb = nullptr;
-    if (!args.empty()) {
-        bind_fn = std::ref(args);
-        bind_cb = [](void *v, int index, DbStatement &stmt) -> int {
-            auto fn = static_cast<db_bind_callback*>(v);
-            return fn->operator()(index, stmt);
-        };
+    static std::mutex m;
+    static sqlite3 *db = nullptr;
+    std::lock_guard<std::mutex> lock(m);
+    if (db == nullptr) {
+        db = open_and_init_db();
     }
-    sql_exec_callback exec_cb = nullptr;
-    if (exec_fn) {
-        exec_cb = [](void *v, StringSlice columns, const DbValues &values) {
-            auto fn = static_cast<db_exec_callback*>(v);
-            fn->operator()(columns, values);
-        };
+    if (db == nullptr) {
+        return false;
     }
-    sql_chk_log_ret(false, sql_exec_rs, sql, bind_cb, &bind_fn, exec_cb, &exec_fn);
+    sql_chk_log_ret(false, sql_exec_impl, db, std::string_view{sql}, &args, &exec_fn);
     return true;
 }
 
